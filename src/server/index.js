@@ -40,11 +40,40 @@ function sendJson(res, status, obj) {
   res.end(body);
 }
 
+// 托管平台会在分享链接后面带 ?sharecode=xxx，静态资源的请求不会自动继承它，
+// 直接请求 /style.css 会被平台网关拦成 403。所以这里把前端打成一个自包含的单文件，
+// 只要页面本身能打开，样式和脚本都在里面，不再依赖第二次请求。
+function inlineEntry() {
+  const sources = {
+    '/style.css': path.join(WEB_DIR, 'style.css'),
+    '/app.js': path.join(WEB_DIR, 'app.js'),
+    '/api.js': path.join(WEB_DIR, 'api.js'),
+  };
+  for (const f of Object.values(sources)) if (!fs.existsSync(f)) return null;
+  const css = fs.readFileSync(sources['/style.css'], 'utf8');
+  const api = fs.readFileSync(sources['/api.js'], 'utf8').replace(/^export\s+/gm, '');
+  const appJs = fs.readFileSync(sources['/app.js'], 'utf8')
+    .replace(/^import\s*\{[\s\S]*?\}\s*from\s*'\.\/api\.js';\s*/m, '')
+    .replace(/^export\s+/gm, '');
+  let html = fs.readFileSync(path.join(WEB_DIR, 'index.html'), 'utf8');
+  html = html.replace('<link rel="stylesheet" href="/style.css">', '<style>\n' + css + '\n</style>');
+  html = html.replace('<script type="module" src="/app.js"></script>',
+    '<script type="module">\n' + api + '\n\n' + appJs + '\n</script>');
+  return html;
+}
+
 function serveStatic(req, res, pathname) {
   let rel = decodeURIComponent(pathname);
   if (rel === '/' || rel === '') rel = '/index.html';
   // SPA 路由回退：/s/:token、/join/:token、/g/:id 等都交给 index.html
   if (!path.extname(rel)) rel = '/index.html';
+  if (rel === '/index.html') {
+    const page = inlineEntry();
+    if (page) {
+      res.writeHead(200, { 'content-type': MIME['.html'], 'cache-control': 'no-cache' });
+      return res.end(page);
+    }
+  }
   const fp = path.join(WEB_DIR, rel);
   if (!fp.startsWith(WEB_DIR) || !fs.existsSync(fp) || fs.statSync(fp).isDirectory()) {
     const index = path.join(WEB_DIR, 'index.html');
