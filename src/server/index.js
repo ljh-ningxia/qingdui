@@ -165,10 +165,12 @@ function createServer() {
 module.exports = { createServer, handle };
 
 if (require.main === module) {
-  const port = Number(process.env.QD_PORT || process.argv[2] || 3001);
+  const port = Number(process.env.PORT || process.env.QD_PORT || process.argv[2] || 3001);
+  // 部署到托管平台时需要监听 0.0.0.0；本地开发默认只绑回环地址更安全。
+  const host = process.env.QD_HOST || (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
   const server = createServer();
-  server.listen(port, '127.0.0.1', () => {
-    console.log(`轻队 QingDui 已启动： http://127.0.0.1:${port}`);
+  server.listen(port, host, () => {
+    console.log(`轻队 QingDui 已启动： http://${host}:${port}`);
     // C6 修复：真正把提醒与清理跑起来。
     // QD_SCHEDULER=0 可在需要纯净环境（如演示、性能压测）时关掉。
     if (process.env.QD_SCHEDULER !== '0') {
