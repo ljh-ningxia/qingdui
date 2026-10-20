@@ -1,0 +1,38 @@
+# ---- 运行时数据（绝不入库）----
+data/
+*.db
+*.db-shm
+*.db-wal
+*.db-journal
+
+# ---- 日志 ----
+*.log
+server.log
+start*.log
+
+# ---- 上传文件 ----
+uploads/
+
+# ---- 环境变量 / 密钥 ----
+.env
+.env.*
+!.env.example
+
+# ---- 依赖与构建产物（本项目零依赖，仅作防御）----
+node_modules/
+dist/
+build/
+
+# ---- 编辑器与系统 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ---- 临时文件 ----
+*.tmp
+*.temp
+*.bak

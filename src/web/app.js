@@ -1,0 +1,1940 @@
+import {
+  api, state, setToken, navigate, route, render, currentPath, esc, avatarHtml,
+  toast, openModal, nowMs, fmtDue, fmtTime, fmtSize, deviceId, initial,
+} from './api.js';
+
+const app = document.getElementById('app');
+
+// PRD 7.5：看板列内默认只渲染 20 条，超过则给「加载更多」（逾期横条始终全量）
+const COL_PAGE = 20;
+let colLimit = COL_PAGE;
+
+/* =========================================================
+   登录（PRD 7.2：手机号 + 验证码；本地开发直接显示验证码）
+   ========================================================= */
+async function sendCode(phone, btn) {
+  try {
+    btn.disabled = true;
+    const r = await api('/api/auth/send-code', { body: { phone } });
+    if (r.dev_code) {
+      const box = document.getElementById('dev-code');
+      if (box) {
+        box.style.display = 'block';
+        box.innerHTML = `本地开发模式：验证码 <strong class="mono" style="font-size:17px;letter-spacing:3px">${r.dev_code}</strong>
+          <button class="btn btn-sm" id="fill-code" style="margin-left:8px">直接填入</button>`;
+        document.getElementById('fill-code').onclick = () => {
+          const inp = document.getElementById('code');
+          if (inp) { inp.value = r.dev_code; inp.focus(); }
+        };
+      }
+      toast('验证码已生成');
+    } else {
+      toast('验证码已发送');
+    }
+  } catch (e) {
+    toast(e.message, 'err');
+  } finally {
+    let left = 60;
+    btn.disabled = true;
+    const t = setInterval(() => {
+      left -= 1;
+      btn.textContent = left + ' 秒后重发';
+      if (left <= 0) { clearInterval(t); btn.disabled = false; btn.textContent = '获取验证码'; }
+    }, 1000);
+    btn.textContent = left + ' 秒后重发';
+  }
+}
+
+async function doLogin(phone, code, opts = {}) {
+  const r = await api('/api/auth/login', {
+    body: { phone, code, device_id: deviceId(), human_verified: opts.humanVerified },
+  });
+  setToken(r.token);
+  state.user = r.user;
+  if (opts.afterLogin) opts.afterLogin(r);
+  // PRD 11.1 AC-02：登录后回到原任务并保留操作意图
+  const pending = sessionStorage.getItem('qd_pending');
+  if (pending) {
+    sessionStorage.removeItem('qd_pending');
+    const { path, action, taskId } = JSON.parse(pending);
+    if (action === 'claim' && taskId) {
+      try {
+        await api(`/api/tasks/${taskId}/claim`, { body: {} });
+        toast('这件事归你了，到期前一天我会提醒你', 'ok');
+      } catch (e) { toast(e.message, 'err'); }
+    }
+    navigate(path || '/my', { replace: true });
+    return r;
+  }
+  navigate(opts.redirect || '/my', { replace: true });
+  return r;
+}
+
+function loginPage({ query, redirect, why }) {
+  const phonePre = query && query.phone ? esc(query.phone) : '';
+  app.innerHTML = `
+  <div class="auth-wrap">
+    <div class="auth-card">
+      <div class="brand" style="border:none;padding:0 0 18px">
+        <div class="brand-mark">轻</div>
+        <div>
+          <div class="brand-name">轻队</div>
+          <div class="brand-sub">QingDui</div>
+        </div>
+      </div>
+      <div class="card card-pad">
+        <h2 style="margin:0 0 4px;font-size:19px;letter-spacing:-.3px">${why ? esc(why) : '用手机号登录，30 秒'}</h2>
+        <p class="small muted" style="margin:0 0 18px">不设密码，不发邮件，只要一个验证码。</p>
+        <div class="field">
+          <label for="phone">手机号</label>
+          <input class="input" id="phone" inputmode="numeric" maxlength="11" placeholder="11 位手机号" value="${phonePre}">
+        </div>
+        <div class="field">
+          <label for="code">验证码</label>
+          <div class="row">
+            <input class="input code-input" id="code" inputmode="numeric" maxlength="6" placeholder="······">
+            <button class="btn" id="send-btn" style="min-width:118px">获取验证码</button>
+          </div>
+          <div id="dev-code" class="hint" style="display:none;background:#F2F6F4;border:1px dashed #BFD3CB;border-radius:8px;padding:8px 10px;margin-top:8px"></div>
+        </div>
+        <div id="human" style="display:none" class="banner mt8">
+          <span>检测到同一设备今天注册较多，请确认不是机器操作。</span>
+          <span class="spacer"></span>
+          <button class="btn btn-sm" id="human-ok">我是真人</button>
+        </div>
+        <button class="btn btn-primary btn-lg btn-block mt8" id="login-btn">登录</button>
+        <p class="tiny muted center mt12" style="margin-bottom:0">登录即表示同意《用户协议》与《隐私政策》。我们只收集手机号，不读通讯录、不取位置。</p>
+      </div>
+      <p class="tiny muted center mt16">微信群负责说，轻队负责记住谁什么时候交</p>
+    </div>
+  </div>`;
+
+  let humanOk = false;
+  const phoneEl = document.getElementById('phone');
+  const codeEl = document.getElementById('code');
+  const sendBtn = document.getElementById('send-btn');
+
+  sendBtn.onclick = () => {
+    const p = phoneEl.value.trim();
+    if (!/^1[3-9]\d{9}$/.test(p)) { toast('手机号格式不对', 'err'); phoneEl.focus(); return; }
+    sendCode(p, sendBtn);
+  };
+
+  document.getElementById('human-ok') && (document.getElementById('human-ok').onclick = (e) => {
+    humanOk = true;
+    e.target.textContent = '已确认';
+    e.target.disabled = true;
+  });
+
+  const submit = async () => {
+    const p = phoneEl.value.trim();
+    const c = codeEl.value.trim();
+    if (!/^1[3-9]\d{9}$/.test(p)) { toast('手机号格式不对', 'err'); return; }
+    if (!/^\d{6}$/.test(c)) { toast('验证码是 6 位数字', 'err'); return; }
+    const btn = document.getElementById('login-btn');
+    btn.disabled = true; btn.textContent = '登录中…';
+    try {
+      await doLogin(p, c, { humanVerified: humanOk, redirect });
+    } catch (e) {
+      if (e.detail && e.detail.code === 'HUMAN_CHECK') {
+        document.getElementById('human').style.display = 'flex';
+        toast('请先完成人机校验', 'err');
+      } else {
+        toast(e.message, 'err');
+      }
+      btn.disabled = false; btn.textContent = '登录';
+    }
+  };
+  document.getElementById('login-btn').onclick = submit;
+  codeEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') submit(); });
+  phoneEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') sendBtn.click(); });
+}
+
+route('/login', async ({ query }) => {
+  loginPage({ query, redirect: query.next || '/my' });
+});
+
+/* =========================================================
+   应用外壳
+   ========================================================= */
+async function loadMe() {
+  if (!state.token) return null;
+  try {
+    const r = await api('/api/me');
+    state.user = r.user;
+    return r.user;
+  } catch (e) {
+    if (e.status === 401) { setToken(''); state.user = null; }
+    return null;
+  }
+}
+
+async function loadGroups() {
+  const r = await api('/api/groups');
+  state.groups = r.groups;
+  return r.groups;
+}
+
+async function refreshUnread() {
+  try {
+    const r = await api('/api/notifications');
+    state.unread = r.unread;
+    return r;
+  } catch { return { items: [], unread: 0 }; }
+}
+
+function sidebarHtml(activePath) {
+  const g = state.currentGroupId;
+  return `
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">轻</div>
+      <div>
+        <div class="brand-name">轻队</div>
+        <div class="brand-sub">QingDui</div>
+      </div>
+    </div>
+    <nav class="nav">
+      <button class="nav-item ${activePath === '/my' ? 'active' : ''}" data-nav="/my">
+        <span>我的任务</span>
+        ${state.unread ? `<span class="badge badge-danger">${state.unread}</span>` : ''}
+      </button>
+      <div class="nav-section nav-label">小组</div>
+      ${state.groups.map((gr) => `
+        <button class="nav-item nav-group ${activePath.startsWith('/g/' + gr.id) && state.currentGroupId === gr.id ? 'active' : ''}" data-nav="/g/${gr.id}/board">
+          <span class="dot" style="background:${gr.overdue_tasks ? 'var(--danger)' : 'var(--brand-2)'}"></span>
+          <span style="overflow:hidden;text-overflow:ellipsis">${esc(gr.name)}</span>
+          <span class="tiny muted" style="margin-left:auto">${gr.active_tasks}</span>
+        </button>
+      `).join('')}
+      <button class="nav-item" id="new-group">
+        <span style="color:var(--brand)">＋ 建一个小组</span>
+      </button>
+      ${g ? `
+        <div class="nav-section nav-label">当前小组</div>
+        <button class="nav-item ${activePath.includes('/board') ? 'active' : ''}" data-nav="/g/${g}/board">看板</button>
+        <button class="nav-item ${activePath.includes('/list') ? 'active' : ''}" data-nav="/g/${g}/list">列表</button>
+        <button class="nav-item ${activePath.includes('/files') ? 'active' : ''}" data-nav="/g/${g}/files">文件</button>
+        <button class="nav-item ${activePath.includes('/members') ? 'active' : ''}" data-nav="/g/${g}/members">成员</button>
+        <button class="nav-item ${activePath.includes('/settings') ? 'active' : ''}" data-nav="/g/${g}/settings">设置</button>
+      ` : ''}
+      <div class="nav-section nav-label">账号</div>
+      <button class="nav-item ${activePath === '/settings' ? 'active' : ''}" data-nav="/settings">
+        <span>通知与账号</span>
+        ${state.unread ? '<span class="badge">' + state.unread + '</span>' : ''}
+      </button>
+      <button class="nav-item" data-nav="/plan">高级版</button>
+    </nav>
+    <div style="padding:10px 14px;border-top:1px solid var(--line-2)" class="tiny muted">
+      ${esc(state.user ? state.user.nickname : '')} · ${esc(state.user ? state.user.phone_masked : '')}
+    </div>
+  </aside>`;
+}
+
+function shell({ title, activePath, body, actions = '' }) {
+  app.innerHTML = `
+    <div class="shell">
+      ${sidebarHtml(activePath)}
+      <div class="main">
+        <div class="topbar">
+          <h1>${esc(title)}</h1>
+          <div class="spacer"></div>
+          ${actions}
+          <button class="btn btn-sm" id="notif-btn" style="position:relative">
+            提醒${state.unread ? `<span class="badge badge-danger" style="margin-left:5px">${state.unread}</span>` : ''}
+          </button>
+        </div>
+        <div class="content" id="content">${body}</div>
+      </div>
+    </div>`;
+
+  app.querySelectorAll('[data-nav]').forEach((b) => {
+    b.onclick = () => navigate(b.dataset.nav);
+  });
+  const ng = document.getElementById('new-group');
+  if (ng) ng.onclick = newGroupModal;
+  const nb = document.getElementById('notif-btn');
+  if (nb) nb.onclick = notificationsModal;
+}
+
+async function requireAuth() {
+  if (!state.token) {
+    navigate('/login?next=' + encodeURIComponent(currentPath()), { replace: true });
+    return false;
+  }
+  if (!state.user) {
+    const u = await loadMe();
+    if (!u) {
+      navigate('/login?next=' + encodeURIComponent(currentPath()), { replace: true });
+      return false;
+    }
+  }
+  if (!state.groups.length) await loadGroups();
+  return true;
+}
+
+/* =========================================================
+   我的任务（默认首页，PRD 7.5）
+   ========================================================= */
+async function myTasksPage({ authed = true } = {}) {
+  if (authed && !(await requireAuth())) return;
+  const [data, notif] = await Promise.all([api('/api/my-tasks'), refreshUnread()]);
+  state.serverOffset = data.server_now - Date.now();
+  const b = data.buckets;
+
+  const row = (t) => `
+    <div class="task-row ${t.priority === 'high' ? 'prio-high' : ''}" data-task="${t.id}">
+      <button class="task-check" data-check="${t.id}" title="标记完成"></button>
+      <div class="task-title">${esc(t.title)}</div>
+      <div class="task-meta">
+        ${t.tags.length ? t.tags.map((x) => `<span class="badge">${esc(x)}</span>`).join('') : ''}
+        <span class="tiny muted">${esc(t.group_name)}</span>
+        ${t.due_at ? `<span class="badge ${t.is_overdue ? 'badge-danger' : ''}">${t.is_overdue ? '逾期 ' + t.overdue_days + ' 天' : esc(t.due_label)}</span>` : '<span class="tiny" style="color:var(--ink-4)">无截止</span>'}
+      </div>
+    </div>`;
+
+  const section = (label, items, kind = '') => {
+    if (!items.length) return '';
+    return `
+      <div class="mt16">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="font-size:13px;margin:0;letter-spacing:.3px;color:${kind === 'overdue' ? 'var(--danger)' : 'var(--ink-2)'}">${label}</h2>
+          <span class="badge ${kind === 'overdue' ? 'badge-danger' : ''}">${items.length}</span>
+        </div>
+        <div class="card" style="padding:5px">${items.map(row).join('')}</div>
+      </div>`;
+  };
+
+  const total = b.overdue.length + b.today.length + b.week.length + b.later.length;
+  const body = total === 0 && !data.unassigned.length ? `
+    <div class="card empty">
+      <div class="empty-title">今天没有事要做</div>
+      <div class="small">还没有任务。把群里那句话粘进来，30 秒变成一条待办</div>
+      <button class="btn btn-primary mt16" id="first-task">建一个小组，开始派活</button>
+    </div>` : `
+    ${b.overdue.length ? `<div class="banner err" style="margin-bottom:4px">
+      <strong>${b.overdue.length} 件事已经逾期</strong>
+      <span class="spacer"></span>
+      <span class="small">先处理最久的</span>
+    </div>` : ''}
+    ${section('已逾期', b.overdue, 'overdue')}
+    ${section('今天到期', b.today)}
+    ${section('本周', b.week)}
+    ${section('以后', b.later)}
+    ${data.unassigned.length ? `
+      <div class="mt24">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="font-size:13px;margin:0;color:var(--ink-2)">待认领（小组里没人接的活）</h2>
+          <span class="badge">${data.unassigned.length}</span>
+        </div>
+        <div class="card" style="padding:5px">
+          ${data.unassigned.map((t) => `
+            <div class="task-row" data-task="${t.id}">
+              <span class="avatar" style="background:var(--line);color:var(--ink-4)">?</span>
+              <div class="task-title">${esc(t.title)}</div>
+              <div class="task-meta">
+                <span class="tiny muted">${esc(t.group_name)}</span>
+                ${t.due_at ? `<span class="badge">${esc(t.due_label)}</span>` : ''}
+                <button class="btn btn-sm" data-claim="${t.id}">认领</button>
+              </div>
+            </div>`).join('')}
+        </div>
+      </div>` : ''}
+    <div class="mt24 center small muted">
+      你在 ${state.groups.length} 个小组里 · 本周完成会显示在成员列表
+    </div>`;
+
+  shell({
+    title: '我的任务',
+    activePath: '/my',
+    body,
+    actions: `<button class="btn btn-sm btn-primary" id="quick-add">＋ 新建任务</button>`,
+  });
+
+  const fa = document.getElementById('first-task');
+  if (fa) fa.onclick = newGroupModal;
+  document.getElementById('quick-add').onclick = () => {
+    if (!state.groups.length) return newGroupModal();
+    newTaskModal(state.groups[0].id);
+  };
+
+  app.querySelectorAll('[data-task]').forEach((elm) => {
+    elm.onclick = (e) => {
+      if (e.target.closest('[data-check]') || e.target.closest('[data-claim]')) return;
+      const gid = (state.groups.find((g) => true) || {}).id;
+      navigate(`/t/${elm.dataset.task}`);
+    };
+  });
+  app.querySelectorAll('[data-check]').forEach((b2) => {
+    b2.onclick = async (e) => {
+      e.stopPropagation();
+      try {
+        await api(`/api/tasks/${b2.dataset.check}/status`, { body: { status: 'done' } });
+        toast('已完成', 'ok');
+        myTasksPage({ authed: false });
+      } catch (err) {
+        if (err.detail && err.detail.need_reason) toast('这个任务需要从看板重新打开', 'err');
+        else toast(err.message, 'err');
+      }
+    };
+  });
+  app.querySelectorAll('[data-claim]').forEach((b2) => {
+    b2.onclick = async (e) => {
+      e.stopPropagation();
+      try {
+        const r = await api(`/api/tasks/${b2.dataset.claim}/claim`, { body: {} });
+        toast(r.message || '认领成功', 'ok');
+        myTasksPage({ authed: false });
+      } catch (err) { toast(err.message, 'err'); }
+    };
+  });
+}
+
+route('/my', () => myTasksPage());
+route('/', () => navigate('/my', { replace: true }));
+
+/* =========================================================
+   新建小组
+   ========================================================= */
+function newGroupModal() {
+  openModal(`
+    <div class="modal-head"><h3>建一个小组</h3></div>
+    <div class="modal-body">
+      <div class="field">
+        <label>小组叫什么</label>
+        <input class="input" id="gname" maxlength="20" placeholder="例如：毕业设计小组" value="">
+        <div class="hint">1–20 字。建好后会先放 3 条示例任务，可以一键清空。</div>
+      </div>
+      <div class="banner" style="background:var(--brand-soft);border-color:#CFE0DA;color:var(--brand)">
+        <span>建完立刻能拿到邀请链接，发到微信群里，组员点开就能加入。</span>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close>取消</button>
+      <button class="btn btn-primary" id="create-g">建组</button>
+    </div>`, {
+    onMount(modal, close) {
+      const btn = modal.querySelector('#create-g');
+      const nameEl = modal.querySelector('#gname');
+      const go = async () => {
+        btn.disabled = true; btn.textContent = '创建中…';
+        try {
+          const r = await api('/api/groups', { body: { name: nameEl.value.trim() || '我的小组' } });
+          close();
+          await loadGroups();
+          state.currentGroupId = r.group.id;
+          toast('小组建好了，去邀请成员吧', 'ok');
+          navigate(`/g/${r.group.id}/members?invite=1`);
+        } catch (e) {
+          if (e.detail && e.detail.trigger === 'group_limit') {
+            close();
+            paywallModal({ trigger: 'group_limit', message: e.message, exits: ['archive', 'upgrade'] });
+          } else toast(e.message, 'err');
+          btn.disabled = false; btn.textContent = '建组';
+        }
+      };
+      btn.onclick = go;
+      nameEl.addEventListener('keydown', (e) => { if (e.key === 'Enter') go(); });
+      modal.querySelector('[data-close]').onclick = close;
+    },
+  });
+}
+
+/* =========================================================
+   任务详情（PRD 8.2）
+   ========================================================= */
+async function taskPage({ params }) {
+  if (!(await requireAuth())) return;
+  let d;
+  try {
+    d = await api(`/api/tasks/${params.id}`);
+  } catch (e) {
+    shell({ title: '任务', activePath: '', body: `<div class="card empty"><div class="empty-title">${esc(e.message)}</div><a class="btn mt16" href="/my" data-nav="/my">回到我的任务</a></div>` });
+    app.querySelectorAll('[data-nav]').forEach((b) => { b.onclick = () => navigate(b.dataset.nav); });
+    return;
+  }
+  const t = d.task;
+  state.currentGroupId = t.group_id;
+  const acts = d.activities;
+  const actionText = {
+    create: '<span class="who">创建了</span>这件事',
+    status_change: `<span class="who">改了状态</span>`,
+    reopen: '<span class="who">重新打开了</span>',
+    assign: '<span class="who">改了责任人</span>',
+    due_change: '<span class="who">改了截止时间</span>',
+    claim: '<span class="who">认领了</span>',
+    comment: '<span class="who">评论了</span>',
+    file_add: '<span class="who">上传了文件</span>',
+    file_delete: '<span class="who">删除了文件</span>',
+    nudge: '<span class="who">催办了一次</span>',
+    delete: '<span class="who">删除了任务</span>',
+    restore: '<span class="who">恢复了任务</span>',
+  };
+  const statusLabel = { todo: '待办', doing: '进行中', done: '已完成', cancelled: '已取消' };
+
+  shell({
+    title: t.title,
+    activePath: `/g/${t.group_id}/board`,
+    actions: `<button class="btn btn-sm" id="share-btn">发到群里</button>`,
+    body: `
+    <div class="detail-grid">
+      <div>
+        <div class="card card-pad">
+          <div class="row" style="align-items:flex-start">
+            <div style="flex:1;min-width:0">
+              <div class="row" style="gap:7px;margin-bottom:8px;flex-wrap:wrap">
+                <span class="badge ${t.status === 'done' ? 'badge-ok' : t.status === 'doing' ? 'badge-brand' : t.status === 'cancelled' ? '' : 'badge-warn'}">${statusLabel[t.status]}</span>
+                <span class="badge ${t.priority === 'high' ? 'badge-danger' : ''}">${t.priority === 'high' ? '高优先级' : t.priority === 'low' ? '低优先级' : '中优先级'}</span>
+                ${t.is_overdue ? `<span class="badge badge-danger">已逾期 ${t.overdue_days} 天</span>` : ''}
+                ${t.tags.map((x) => `<span class="badge">${esc(x)}</span>`).join('')}
+              </div>
+              <h2 style="margin:0 0 4px;font-size:19px;line-height:1.42;letter-spacing:-.3px">${esc(t.title)}</h2>
+              <div class="tiny muted">${esc(d.group.name)} · 由 ${esc(t.creator ? t.creator.nickname : '')} 创建于 ${fmtTime(t.created_at)}</div>
+            </div>
+          </div>
+          ${t.description ? `<div class="mt16" style="white-space:pre-wrap;font-size:14px;color:var(--ink-2);line-height:1.7;padding-top:14px;border-top:1px solid var(--line-2)">${esc(t.description)}</div>` : ''}
+          <div class="mt16 row" style="gap:8px;flex-wrap:wrap;border-top:1px solid var(--line-2);padding-top:14px">
+            ${statusButtons(t)}
+          </div>
+        </div>
+
+        <div class="card mt16">
+          <div class="card-head">
+            <h2>附件</h2><span class="badge">${d.attachments.length}</span>
+            <span class="spacer"></span>
+            <label class="btn btn-sm" style="cursor:pointer">
+              上传文件<input type="file" id="file-input" style="display:none">
+            </label>
+          </div>
+          <div class="card-pad" style="padding-top:6px;padding-bottom:10px">
+            <div id="files">${d.attachments.length ? '' : '<div class="small muted">还没有附件。文件和任务放在一起，汇总时不用翻聊天记录。</div>'}</div>
+          </div>
+        </div>
+
+        <div class="card mt16">
+          <div class="card-head"><h2>评论</h2><span class="spacer"></span><span class="tiny muted">@ 成员会收到站内通知</span></div>
+          <div class="card-pad">
+            <div id="comments">${d.comments.length ? d.comments.map(commentHtml).join('') : '<div class="small muted">还没有人说话。有疑问就挂在任务下面，别回群里刷屏。</div>'}</div>
+            <div class="row mt12">
+              <input class="input" id="comment-input" placeholder="说点什么，@ 可以提醒组员…">
+              <button class="btn btn-primary" id="comment-send">发送</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div>
+        <div class="card card-pad">
+          <div class="kv"><span class="k">责任人</span><span class="v row" style="gap:6px">${t.assignee ? avatarHtml(t.assignee) + '<span>' + esc(t.assignee.nickname) + '</span>' : '<span class="badge">待指派</span>'}</span></div>
+          <div class="kv"><span class="k">截止</span><span class="v ${t.is_overdue ? '' : ''}" style="${t.is_overdue ? 'color:var(--danger);font-weight:600' : ''}">${t.due_at ? fmtDue(t.due_at) + '（' + new Date(t.due_at).toLocaleString('zh-CN', { timeZone: 'Asia/Shanghai', hour12: false }).replace(/\//g, '-') + '）' : '无截止时间'}</span></div>
+          <div class="kv"><span class="k">创建者</span><span class="v">${esc(t.creator ? t.creator.nickname : '')}</span></div>
+          <div class="kv"><span class="k">状态</span><span class="v">${statusLabel[t.status]}${t.started_at ? ' · ' + fmtTime(t.started_at) + ' 开始' : ''}${t.completed_at ? ' · ' + fmtTime(t.completed_at) + ' 完成' : ''}</span></div>
+          <div class="row mt12" style="gap:7px;flex-wrap:wrap">
+            <button class="btn btn-sm" id="edit-btn">编辑</button>
+            ${t.assignee_id ? '' : '<button class="btn btn-sm btn-primary" id="claim-btn">认领这件事</button>'}
+            <button class="btn btn-sm" id="ics-btn">加入日历</button>
+            <button class="btn btn-sm btn-danger" id="del-btn">删除</button>
+          </div>
+        </div>
+
+        <div class="card mt16">
+          <div class="card-head"><h2>动态</h2><span class="spacer"></span><span class="tiny muted">不可编辑、不可删除</span></div>
+          <div class="card-pad" style="padding-top:4px">
+            ${acts.map((a) => `
+              <div class="act">
+                ${avatarHtml({ nickname: a.nickname, avatar_color: a.avatar_color })}
+                <div style="flex:1;min-width:0">
+                  <span class="who">${esc(a.nickname)}</span>
+                  ${actionText[a.action] || esc(a.action)}
+                  ${a.action === 'status_change' ? `<span class="badge" style="margin:0 3px">${statusLabel[a.from_value] || a.from_value} → ${statusLabel[a.to_value] || a.to_value}</span>` : ''}
+                  ${a.action === 'assign' ? `<span>（${esc(nameOf(d.group.id, a.from_value))} → ${esc(nameOf(d.group.id, a.to_value))}）</span>` : ''}
+                  ${a.action === 'due_change' ? `<span class="tiny muted">（${a.to_value ? fmtDue(Number(a.to_value)) : '无截止'}）</span>` : ''}
+                  ${a.action === 'create' ? `<span>「${esc(a.to_value || '')}」</span>` : ''}
+                </div>
+                <span class="when">${fmtTime(a.created_at)}</span>
+              </div>`).join('') || '<div class="small muted" style="padding:8px 0">暂无动态</div>'}
+          </div>
+        </div>
+      </div>
+    </div>`,
+  });
+
+  // 状态按钮
+  app.querySelectorAll('[data-status]').forEach((b) => {
+    b.onclick = async () => {
+      const next = b.dataset.status;
+      if (next === 'cancelled') {
+        openModal(`
+          <div class="modal-head"><h3>确定取消这个任务？</h3></div>
+          <div class="modal-body"><p class="small" style="margin:0">取消后任务会进入看板的归档列，可以随时恢复。取消的任务不计入按时完成率。</p></div>
+          <div class="modal-foot"><button class="btn" data-close>算了</button><button class="btn btn-danger" id="ok-cancel">确定取消</button></div>`, {
+          onMount(m, close) {
+            m.querySelector('[data-close]').onclick = close;
+            m.querySelector('#ok-cancel').onclick = async () => {
+              try { await api(`/api/tasks/${t.id}/status`, { body: { status: 'cancelled', confirm: true } }); close(); toast('已取消'); taskPage({ params }); }
+              catch (e) { toast(e.message, 'err'); }
+            };
+          },
+        });
+        return;
+      }
+      if (t.status === 'done' && next === 'todo') {
+        openModal(`
+          <div class="modal-head"><h3>重新打开</h3></div>
+          <div class="modal-body">
+            <div class="field"><label>为什么重新打开</label><input class="input" id="reason" placeholder="例如：交付物不合格，需要补一版"></div>
+          </div>
+          <div class="modal-foot"><button class="btn" data-close>算了</button><button class="btn btn-primary" id="ok">重新打开</button></div>`, {
+          onMount(m, close) {
+            m.querySelector('[data-close]').onclick = close;
+            m.querySelector('#ok').onclick = async () => {
+              const reason = m.querySelector('#reason').value.trim();
+              if (!reason) return toast('必须填写原因', 'err');
+              try { await api(`/api/tasks/${t.id}/status`, { body: { status: 'todo', reason } }); close(); toast('已重新打开'); taskPage({ params }); }
+              catch (e) { toast(e.message, 'err'); }
+            };
+          },
+        });
+        return;
+      }
+      try {
+        await api(`/api/tasks/${t.id}/status`, { body: { status: next, version: t.version } });
+        toast('状态已更新', 'ok');
+        taskPage({ params });
+      } catch (e) {
+        toast(e.message, 'err');
+        if (e.status === 409) taskPage({ params });
+      }
+    };
+  });
+
+  const claimBtn = document.getElementById('claim-btn');
+  if (claimBtn) claimBtn.onclick = async () => {
+    try {
+      const r = await api(`/api/tasks/${t.id}/claim`, { body: {} });
+      toast(r.message, 'ok');
+      taskPage({ params });
+    } catch (e) { toast(e.message, 'err'); }
+  };
+
+  document.getElementById('edit-btn').onclick = () => editTaskModal(t, d.group.id, () => taskPage({ params }));
+  document.getElementById('del-btn').onclick = () => {
+    openModal(`
+      <div class="modal-head"><h3>删除这个任务？</h3></div>
+      <div class="modal-body"><p class="small" style="margin:0">删除后进入回收站，<strong>7 天内可以恢复</strong>。若只想让它从看板消失，可以用「取消」。</p></div>
+      <div class="modal-foot"><button class="btn" data-close>取消</button><button class="btn btn-danger" id="ok">删除</button></div>`, {
+      onMount(m, close) {
+        m.querySelector('[data-close]').onclick = close;
+        m.querySelector('#ok').onclick = async () => {
+          try { await api(`/api/tasks/${t.id}`, { method: 'DELETE' }); close(); toast('已移入回收站，7 天内可以恢复'); navigate(`/g/${t.group_id}/board`); }
+          catch (e) { toast(e.message, 'err'); }
+        };
+      },
+    });
+  };
+
+  document.getElementById('share-btn').onclick = () => shareModal(t.id, () => taskPage({ params }));
+
+  document.getElementById('ics-btn').onclick = async () => {
+    const url = `/api/groups/${t.group_id}/ics`;
+    const res = await fetch(url, { headers: { authorization: `Bearer ${state.token}` } });
+    if (!res.ok) return toast('导出失败', 'err');
+    const blob = await res.blob();
+    const a = document.createElement('a');
+    a.href = URL.createObjectURL(blob);
+    a.download = d.group.name + '.ics';
+    a.click();
+    toast('日历文件已下载，双击即可导入手机日历', 'ok');
+  };
+
+  // 文件
+  loadFiles(t.id);
+  document.getElementById('file-input').onchange = async (e) => {
+    const f = e.target.files[0];
+    if (f) await uploadFile(t.id, f, t.group_id);
+  };
+
+  // 评论
+  const send = async () => {
+    const inp = document.getElementById('comment-input');
+    const v = inp.value.trim();
+    if (!v) return;
+    try {
+      const r = await api(`/api/tasks/${t.id}/comments`, { body: { content: v } });
+      inp.value = '';
+      if (r.mention_notified && r.mention_notified.length) toast('已发送，并通知了被 @ 的人', 'ok');
+      taskPage({ params });
+    } catch (err) { toast(err.message, 'err'); }
+  };
+  document.getElementById('comment-send').onclick = send;
+  document.getElementById('comment-input').addEventListener('keydown', (e) => { if (e.key === 'Enter') send(); });
+}
+
+function nameOf(groupId, uid) {
+  if (!uid || uid === 'null') return '待指派';
+  const g = state.groups.find((x) => x.id === groupId);
+  const m = (state.membersCache || {})[uid];
+  return m || '组员';
+}
+
+function commentHtml(c) {
+  return `<div class="comment">
+    ${avatarHtml({ nickname: c.nickname, avatar_color: c.avatar_color })}
+    <div class="bubble">
+      <div class="row" style="gap:6px"><span class="name">${esc(c.nickname)}</span><span class="tiny muted">${fmtTime(c.created_at)}</span></div>
+      <div class="txt">${esc(c.content).replace(/@([^\s@]{1,20})/g, '<span class="at">@$1</span>')}</div>
+    </div>
+  </div>`;
+}
+
+function statusButtons(t) {
+  const b = [];
+  if (t.status === 'todo') {
+    b.push('<button class="btn btn-sm btn-primary" data-status="doing">开始做</button>');
+    b.push('<button class="btn btn-sm" data-status="done">直接完成</button>');
+    b.push('<button class="btn btn-sm" data-status="cancelled">取消</button>');
+  } else if (t.status === 'doing') {
+    b.push('<button class="btn btn-sm btn-primary" data-status="done">标记完成</button>');
+    b.push('<button class="btn btn-sm" data-status="todo">退回待办</button>');
+    b.push('<button class="btn btn-sm" data-status="cancelled">取消</button>');
+  } else if (t.status === 'done') {
+    b.push('<button class="btn btn-sm" data-status="todo">重新打开</button>');
+  } else if (t.status === 'cancelled') {
+    b.push('<button class="btn btn-sm" data-status="todo">恢复这个任务</button>');
+  }
+  return b.join('');
+}
+
+async function loadFiles(taskId) {
+  const box = document.getElementById('files');
+  if (!box) return;
+  try {
+    const r = await api(`/api/tasks/${taskId}/files`);
+    state.files = r.files;
+    if (!r.files.length) return;
+    box.innerHTML = r.files.map((f) => `
+      <div class="file-item">
+        <span class="badge">${esc((f.name.split('.').pop() || 'file').slice(0, 4))}</span>
+        <span class="n" title="${esc(f.name)}">${esc(f.name)}</span>
+        ${f.hidden_versions ? `<span class="badge badge-warn" data-paywall="version">还有 ${f.hidden_versions} 个历史版本</span>` : ''}
+        ${f.versions.length > 1 ? `<span class="badge" title="共 ${f.versions.length} 个版本">v${f.versions[0].version_no}</span>` : ''}
+        <span class="tiny muted nowrap">${fmtSize(f.current ? f.current.size : 0)}</span>
+        <button class="btn btn-sm" data-dl="${f.current ? f.current.id : ''}">下载</button>
+      </div>`).join('');
+    box.querySelectorAll('[data-dl]').forEach((btn) => {
+      btn.onclick = async () => {
+        try {
+          const r = await api(`/api/attachments/${btn.dataset.dl}/url`, { body: {} });
+          const a = document.createElement('a');
+          a.href = r.url; a.download = ''; a.click();
+          toast('链接 15 分钟内有效');
+        } catch (e) { toast(e.message, 'err'); }
+      };
+    });
+    box.querySelectorAll('[data-paywall]').forEach((b) => {
+      b.onclick = () => paywallModal({ trigger: 'version', message: '免费版只保留最近 3 个版本', exits: ['upgrade'] });
+    });
+  } catch (e) { box.innerHTML = `<div class="small muted">${esc(e.message)}</div>`; }
+}
+
+async function uploadFile(taskId, file, groupId) {
+  if (file.size > 20 * 1024 * 1024) {
+    return paywallModal({ trigger: 'single_file', message: '单文件上限 20MB，升级可到 100MB', exits: ['upgrade'] });
+  }
+  const reader = new FileReader();
+  reader.onload = async () => {
+    const b64 = String(reader.result).split(',')[1];
+    try {
+      await api(`/api/tasks/${taskId}/files`, {
+        body: { filename: file.name, size: file.size, mime: file.type || 'application/octet-stream', data_b64: b64 },
+      });
+      toast('上传成功', 'ok');
+      loadFiles(taskId);
+    } catch (e) {
+      if (e.detail && e.detail.trigger) {
+        paywallModal({ trigger: e.detail.trigger, message: e.message, exits: e.detail.exits || ['upgrade'] });
+      } else toast(e.message, 'err');
+    }
+  };
+  reader.readAsDataURL(file);
+}
+
+function shareModal(taskId, onDone) {
+  openModal(`
+    <div class="modal-head"><h3>发到群里</h3></div>
+    <div class="modal-body">
+      <p class="small muted" style="margin:0 0 12px">生成一张只读卡片。组员点开不用登录就能看到—这件事是什么、谁负责、什么时候交。</p>
+      <div class="field">
+        <label>链接有效期</label>
+        <select class="select" id="exp">
+          <option value="0">永久有效</option>
+          <option value="7">7 天</option>
+          <option value="1">1 天</option>
+        </select>
+      </div>
+      <div id="card-preview"></div>
+    </div>
+    <div class="modal-foot"><button class="btn" data-close>关闭</button><button class="btn btn-primary" id="gen">生成卡片</button></div>`, {
+    onMount(m, close) {
+      m.querySelector('[data-close]').onclick = close;
+      m.querySelector('#gen').onclick = async () => {
+        const days = Number(m.querySelector('#exp').value);
+        try {
+          const r = await api(`/api/tasks/${taskId}/share`, { body: { expire_days: days } });
+          const url = location.origin + r.url;
+          m.querySelector('#card-preview').innerHTML = `
+            <div class="card card-pad" style="background:#F8F9F7">
+              <div style="white-space:pre-wrap;font-size:13px;line-height:1.65;color:var(--ink-2)">${esc(r.card.text)}</div>
+              <div class="row mt12">
+                <input class="input mono tiny" id="link" value="${esc(url)}" readonly>
+                <button class="btn btn-sm btn-primary" id="copy">复制</button>
+              </div>
+              <div class="row mt8">
+                <button class="btn btn-sm" id="copy-text">只复制文字</button>
+                <a class="btn btn-sm" href="${esc(url)}" target="_blank">预览效果</a>
+              </div>
+            </div>`;
+          m.querySelector('#copy').onclick = async () => {
+            await navigator.clipboard.writeText(url);
+            toast('链接已复制，去群里发一下吧', 'ok');
+          };
+          m.querySelector('#copy-text').onclick = async () => {
+            await navigator.clipboard.writeText(r.card.text + '\n' + url);
+            toast('卡片文字已复制', 'ok');
+          };
+          if (onDone) onDone();
+        } catch (e) { toast(e.message, 'err'); }
+      };
+    },
+  });
+}
+
+/* =========================================================
+   编辑 / 新建任务
+   ========================================================= */
+async function newTaskModal(groupId, onCreated) {
+  const gid = groupId || (state.groups[0] && state.groups[0].id);
+  if (!gid) return newGroupModal();
+  let members = [];
+  try { members = (await api(`/api/groups/${gid}`)).members; } catch (e) { toast(e.message, 'err'); return; }
+  state.membersCache = Object.fromEntries(members.map((m) => [m.user_id, m.nickname]));
+
+  openModal(`
+    <div class="modal-head"><h3>新建任务</h3><span class="spacer"></span><span class="tiny muted">粘贴群里那句话也行</span></div>
+    <div class="modal-body">
+      <div class="field">
+        <label>做什么</label>
+        <input class="input" id="title" maxlength="80" placeholder="例如：这周把问卷发出去">
+      </div>
+      <div class="row-2">
+        <div class="field">
+          <label>截止</label>
+          <input class="input" id="due" placeholder="周三 / 后天 / 3/15 / 18:00">
+          <div class="hint" id="due-hint">输入「周三」「明天」「3/15」都能懂</div>
+        </div>
+        <div class="field">
+          <label>谁负责</label>
+          <select class="select" id="assignee">
+            <option value="">待指派（谁都能认领）</option>
+            ${members.map((m) => `<option value="${m.user_id}">${esc(m.nickname)}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="field">
+        <label>优先级</label>
+        <select class="select" id="priority">
+          <option value="mid">中</option>
+          <option value="high">高（会显示红色竖条，并加急提醒）</option>
+          <option value="low">低</option>
+        </select>
+      </div>
+      <div class="field">
+        <label>补充说明（可选）</label>
+        <textarea class="textarea" id="desc" maxlength="2000" placeholder="交付物是什么、交给谁、有什么要求"></textarea>
+      </div>
+    </div>
+    <div class="modal-foot">
+      <button class="btn" data-close>取消</button>
+      <button class="btn btn-primary" id="create">创建</button>
+    </div>`, {
+    onMount(m, close) {
+      const dueEl = m.querySelector('#due');
+      const hint = m.querySelector('#due-hint');
+      const check = async () => {
+        const v = dueEl.value.trim();
+        if (!v) { hint.className = 'hint'; hint.textContent = '输入「周三」「明天」「3/15」都能懂'; return; }
+        const r = await api('/api/parse-date?q=' + encodeURIComponent(v));
+        if (r.error) { hint.className = 'hint hint-err'; hint.textContent = r.error; }
+        else { hint.className = 'hint'; hint.textContent = '→ ' + r.iso; }
+      };
+      dueEl.addEventListener('input', check);
+      m.querySelector('[data-close]').onclick = close;
+      const nameEl = m.querySelector('#title');
+      const submit = async () => {
+        const title = nameEl.value.trim();
+        if (!title) { toast('先写清楚要做什么', 'err'); nameEl.focus(); return; }
+        try {
+          await api(`/api/groups/${gid}/tasks`, {
+            body: {
+              title,
+              due: dueEl.value.trim() || null,
+              assignee_id: m.querySelector('#assignee').value || null,
+              priority: m.querySelector('#priority').value,
+              description: m.querySelector('#desc').value,
+            },
+          });
+          close();
+          toast('任务建好了。要发到群里吗？', 'ok');
+          if (onCreated) onCreated();
+        } catch (e) { toast(e.message, 'err'); }
+      };
+      m.querySelector('#create').onclick = submit;
+      nameEl.addEventListener('keydown', (e) => { if (e.key === 'Enter' && !e.shiftKey) submit(); });
+    },
+    wide: false,
+  });
+}
+
+async function editTaskModal(t, groupId, onDone) {
+  let members = [];
+  try { members = (await api(`/api/groups/${groupId}`)).members; } catch { /* ignore */ }
+  state.membersCache = Object.fromEntries(members.map((m) => [m.user_id, m.nickname]));
+  const iso = t.due_at ? new Date(t.due_at).toLocaleString('sv-SE', { timeZone: 'Asia/Shanghai' }).slice(0, 16).replace(' ', ' ') : '';
+  openModal(`
+    <div class="modal-head"><h3>编辑任务</h3></div>
+    <div class="modal-body">
+      <div class="field"><label>做什么</label><input class="input" id="title" maxlength="80" value="${esc(t.title)}"></div>
+      <div class="row-2">
+        <div class="field"><label>截止</label><input class="input" id="due" value="${esc(iso)}" placeholder="周三 / 后天 / 3/15"><div class="hint" id="due-hint"></div></div>
+        <div class="field"><label>谁负责</label>
+          <select class="select" id="assignee">
+            <option value="">待指派</option>
+            ${members.map((m) => `<option value="${m.user_id}" ${m.user_id === t.assignee_id ? 'selected' : ''}>${esc(m.nickname)}</option>`).join('')}
+          </select>
+        </div>
+      </div>
+      <div class="field"><label>优先级</label>
+        <select class="select" id="priority">
+          <option value="high" ${t.priority === 'high' ? 'selected' : ''}>高</option>
+          <option value="mid" ${t.priority === 'mid' ? 'selected' : ''}>中</option>
+          <option value="low" ${t.priority === 'low' ? 'selected' : ''}>低</option>
+        </select>
+      </div>
+      <div class="field"><label>补充说明</label><textarea class="textarea" id="desc" maxlength="2000">${esc(t.description)}</textarea></div>
+      <div class="hint">只有创建者和组长能改标题、截止时间。改期会记入动态流。</div>
+    </div>
+    <div class="modal-foot"><button class="btn" data-close>取消</button><button class="btn btn-primary" id="save">保存</button></div>`, {
+    onMount(m, close) {
+      m.querySelector('[data-close]').onclick = close;
+      const dueEl = m.querySelector('#due');
+      const hint = m.querySelector('#due-hint');
+      dueEl.addEventListener('change', async () => {
+        const v = dueEl.value.trim();
+        if (!v) { hint.textContent = ''; return; }
+        const r = await api('/api/parse-date?q=' + encodeURIComponent(v));
+        hint.textContent = r.error ? r.error : '→ ' + r.iso;
+        hint.className = r.error ? 'hint hint-err' : 'hint';
+      });
+      m.querySelector('#save').onclick = async () => {
+        try {
+          await api(`/api/tasks/${t.id}`, {
+            method: 'PATCH',
+            body: {
+              title: m.querySelector('#title').value.trim(),
+              due: dueEl.value.trim() || null,
+              assignee_id: m.querySelector('#assignee').value || null,
+              priority: m.querySelector('#priority').value,
+              description: m.querySelector('#desc').value,
+              version: t.version,
+            },
+          });
+          close();
+          toast('已保存', 'ok');
+          if (onDone) onDone();
+        } catch (e) {
+          toast(e.message, 'err');
+          if (e.status === 409 && onDone) { close(); onDone(); }
+        }
+      };
+    },
+  });
+}
+
+/* =========================================================
+   看板（PRD 7.5）
+   ========================================================= */
+async function boardPage({ params }) {
+  if (!(await requireAuth())) return;
+  const gid = params.id;
+  if (state.currentGroupId !== gid) colLimit = COL_PAGE;
+  state.currentGroupId = gid;
+  let data;
+  let detail;
+  try {
+    const q = colLimit === COL_PAGE ? '' : '?limit=' + colLimit;
+    [data, detail] = await Promise.all([api(`/api/groups/${gid}/board${q}`), api(`/api/groups/${gid}`)]);
+  } catch (e) {
+    shell({ title: '看板', activePath: '', body: `<div class="card empty"><div class="empty-title">${esc(e.message)}</div></div>` });
+    app.querySelectorAll('[data-nav]').forEach((b) => { b.onclick = () => navigate(b.dataset.nav); });
+    return;
+  }
+  state.serverOffset = data.server_now - Date.now();
+  state.membersCache = Object.fromEntries(detail.members.map((m) => [m.user_id, m.nickname]));
+  const g = detail.group;
+  state.groups = state.groups.map((x) => (x.id === g.id ? { ...x, name: g.name } : x));
+
+  const COLS = [['todo', '待办'], ['doing', '进行中'], ['done', '已完成'], ['cancelled', '已取消']];
+  const card = (t) => `
+    <div class="bcard ${t.priority === 'high' ? 'prio-high' : ''} ${t.status}" draggable="true" data-task="${t.id}" data-status="${t.status}">
+      <div class="t">${esc(t.title)}</div>
+      <div class="m">
+        ${t.assignee ? avatarHtml(t.assignee) : '<span class="badge">待指派</span>'}
+        ${t.due_at ? `<span class="badge ${t.is_overdue ? 'badge-danger' : ''}">${t.is_overdue ? '逾期 ' + t.overdue_days + '天' : esc(t.due_label)}</span>` : ''}
+        ${t.attachments_count ? `<span class="tiny muted">📎 ${t.attachments_count}</span>` : ''}
+      </div>
+    </div>`;
+
+  const attention = data.attention.length ? `
+    <div class="attention">
+      <div class="attention-h">
+        <span>● 需要关注</span>
+        <span class="badge badge-danger">${data.attention.length} 件已逾期</span>
+        <span class="spacer"></span>
+        <button class="btn btn-sm" id="nudge-all">全部催一下</button>
+      </div>
+      <div class="attention-list">
+        ${data.attention.map((t) => `
+          <button class="attention-item" data-jump="${t.id}">
+            <span>${esc(t.title)}</span>
+            <span class="tiny" style="color:var(--danger)">逾期 ${t.overdue_days} 天</span>
+            <span class="tiny muted">${esc(t.assignee ? t.assignee.nickname : '待指派')}</span>
+          </button>`).join('')}
+      </div>
+    </div>` : '';
+
+  const perMember = Object.entries(data.per_member);
+
+  shell({
+    title: g.name,
+    activePath: `/g/${gid}/board`,
+    actions: `
+      <button class="btn btn-sm" id="copy-invite">邀请成员</button>
+      <button class="btn btn-sm btn-primary" id="add-task">＋ 新建任务</button>`,
+    body: `
+      ${attention}
+      <div class="board" id="board">
+        ${COLS.map(([key, label]) => `
+          <div class="col" data-col="${key}">
+            <div class="col-head">
+              <span>${label}</span>
+              <span class="count">${(data.counts && data.counts[key]) || data.columns[key].length}</span>
+              ${key !== 'cancelled' && key !== 'done' ? `<span class="tiny" style="margin-left:auto;color:var(--danger)">${data.columns[key].filter((x) => x.is_overdue).length ? '逾期 ' + data.columns[key].filter((x) => x.is_overdue).length : ''}</span>` : ''}
+            </div>
+            <div class="col-body">
+              ${data.columns[key].map(card).join('')}
+              ${data.has_more && data.has_more[key] ? `<button class="btn btn-sm" style="justify-content:center" data-more="${key}">还有 ${data.counts[key] - data.columns[key].length} 条，加载更多</button>` : ''}
+              ${key !== 'cancelled' && key !== 'done' ? `<button class="btn btn-sm" style="justify-content:flex-start;border-style:dashed" data-add="${key}">＋ 添加</button>` : ''}
+            </div>
+          </div>`).join('')}
+      </div>
+      <div class="card mt24">
+        <div class="card-head"><h2>谁在做什么</h2><span class="spacer"></span><span class="tiny muted">共 ${data.total} 条任务</span></div>
+        <div class="card-pad">
+          <div class="stat-grid">
+            ${perMember.map(([uid, m]) => `
+              <div class="stat">
+                <div class="row" style="gap:7px">${avatarHtml({ nickname: m.nickname, avatar_color: '#3B6EA5' })}
+                  <span class="small" style="font-weight:600">${esc(m.nickname)}</span></div>
+                <div class="n">${m.todo + m.doing}</div>
+                <div class="s">待办 ${m.todo} · 进行中 ${m.doing}${m.overdue ? ` · <span style="color:var(--danger)">逾期 ${m.overdue}</span>` : ''}</div>
+              </div>`).join('')}
+          </div>
+        </div>
+      </div>`,
+  });
+
+  document.getElementById('add-task').onclick = () => newTaskModal(gid, () => boardPage({ params }));
+  document.getElementById('copy-invite').onclick = () => inviteModal(gid);
+  const nudgeAll = document.getElementById('nudge-all');
+  if (nudgeAll) nudgeAll.onclick = () => doNudge(gid, data.attention.map((t) => t.id), () => boardPage({ params }));
+
+  app.querySelectorAll('[data-jump]').forEach((b) => { b.onclick = () => navigate(`/t/${b.dataset.jump}`); });
+  app.querySelectorAll('[data-more]').forEach((b) => {
+    b.onclick = (e) => {
+      e.stopPropagation();
+      colLimit = Math.min(500, colLimit + COL_PAGE);
+      boardPage({ params });
+    };
+  });
+  app.querySelectorAll('[data-add]').forEach((b) => {
+    b.onclick = (e) => { e.stopPropagation(); newTaskModal(gid, () => boardPage({ params })); };
+  });
+
+  // 拖拽（移动端长按 300ms 见 bindTouchDrag）
+  let dragged = null;
+  app.querySelectorAll('.bcard').forEach((c) => {
+    c.addEventListener('dragstart', (e) => {
+      dragged = c;
+      c.classList.add('dragging');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', c.dataset.task);
+    });
+    c.addEventListener('dragend', () => {
+      c.classList.remove('dragging');
+      dragged = null;
+      app.querySelectorAll('.col').forEach((x) => x.classList.remove('drop-target'));
+    });
+    c.addEventListener('click', () => { if (!c.classList.contains('dragging')) navigate(`/t/${c.dataset.task}`); });
+  });
+  app.querySelectorAll('.col').forEach((col) => {
+    col.addEventListener('dragover', (e) => {
+      e.preventDefault();
+      if (dragged) {
+        app.querySelectorAll('.col').forEach((x) => x.classList.remove('drop-target'));
+        if (col.dataset.col !== dragged.dataset.status) col.classList.add('drop-target');
+      }
+    });
+    col.addEventListener('drop', async (e) => {
+      e.preventDefault();
+      col.classList.remove('drop-target');
+      if (!dragged) return;
+      const id = dragged.dataset.task;
+      const next = col.dataset.col;
+      await changeStatus(id, next, () => boardPage({ params }));
+    });
+  });
+  bindTouchDrag(app.querySelectorAll('.bcard'), (id, col) => changeStatus(id, col, () => boardPage({ params })));
+}
+
+function bindTouchDrag(cards, onDrop) {
+  let timer = null;
+  let ghost = null;
+  let source = null;
+  cards.forEach((c) => {
+    c.addEventListener('touchstart', (e) => {
+      source = c;
+      timer = setTimeout(() => {
+        ghost = c.cloneNode(true);
+        ghost.style.cssText = 'position:fixed;pointer-events:none;z-index:300;opacity:.9;width:' + c.offsetWidth + 'px;transform:translate(-50%,-50%)';
+        document.body.appendChild(ghost);
+        c.style.opacity = '.4';
+        if (navigator.vibrate) navigator.vibrate(12);
+      }, 300);
+    }, { passive: true });
+    c.addEventListener('touchmove', (e) => {
+      if (!ghost) return;
+      e.preventDefault();
+      const t = e.touches[0];
+      ghost.style.left = t.clientX + 'px';
+      ghost.style.top = t.clientY + 'px';
+      document.querySelectorAll('.col').forEach((col) => {
+        const r = col.getBoundingClientRect();
+        col.classList.toggle('drop-target', t.clientX > r.left && t.clientX < r.right && t.clientY > r.top && t.clientY < r.bottom);
+      });
+    }, { passive: false });
+    c.addEventListener('touchend', (e) => {
+      clearTimeout(timer);
+      if (!ghost) return;
+      const t = e.changedTouches[0];
+      let target = null;
+      document.querySelectorAll('.col').forEach((col) => {
+        const r = col.getBoundingClientRect();
+        if (t.clientX > r.left && t.clientX < r.right && t.clientY > r.top && t.clientY < r.bottom) target = col;
+      });
+      ghost.remove(); ghost = null;
+      source.style.opacity = '';
+      document.querySelectorAll('.col').forEach((x) => x.classList.remove('drop-target'));
+      if (target && target.dataset.col !== source.dataset.status) {
+        onDrop(source.dataset.task, target.dataset.col);
+      }
+      source = null;
+    });
+  });
+}
+
+/**
+ * 状态变更：PRD 6.3 E-05 / AC-22 的完整实现
+ *  1. 乐观更新：先把卡片挪到目标列，立即给反馈，不等服务器
+ *  2. 失败重试：2s / 4s / 8s 共三次，期间顶部黄条提示「网络不稳定，正在重试」
+ *  3. 全部失败：把卡片回滚到原来的列，并提示原因
+ *  4. 409 冲突：用服务端返回的最新快照刷新，而不是傻回滚
+ */
+const RETRY_DELAYS = [2000, 4000, 8000];
+
+function cardEl(id) {
+  return document.querySelector(`.bcard[data-task="${id}"]`);
+}
+
+function moveCardDom(id, targetStatus) {
+  const card = cardEl(id);
+  if (!card) return null;
+  const fromStatus = card.dataset.status;
+  const targetCol = document.querySelector(`.col[data-col="${targetStatus}"] .col-body`);
+  if (!targetCol) return null;
+  const addBtn = targetCol.querySelector('[data-add]');
+  if (addBtn) targetCol.insertBefore(card, addBtn);
+  else targetCol.appendChild(card);
+  card.dataset.status = targetStatus;
+  card.classList.remove('todo', 'doing', 'done', 'cancelled');
+  card.classList.add(targetStatus);
+  return { card, fromStatus, parent: targetCol, next: card.nextSibling };
+}
+
+function rollbackCard(id, fromStatus) {
+  const targetCol = document.querySelector(`.col[data-col="${fromStatus}"] .col-body`);
+  const card = cardEl(id);
+  if (targetCol && card) {
+    const addBtn = targetCol.querySelector('[data-add]');
+    if (addBtn) targetCol.insertBefore(card, addBtn);
+    else targetCol.appendChild(card);
+    card.dataset.status = fromStatus;
+    card.classList.remove('todo', 'doing', 'done', 'cancelled');
+    card.classList.add(fromStatus);
+    card.style.transition = 'background .3s';
+    card.style.background = 'var(--danger-soft)';
+    setTimeout(() => { card.style.background = ''; }, 900);
+  }
+}
+
+function networkBanner(text) {
+  let bar = document.getElementById('net-banner');
+  if (!text) { if (bar) bar.remove(); return; }
+  if (!bar) {
+    bar = document.createElement('div');
+    bar.id = 'net-banner';
+    bar.className = 'banner';
+    bar.style.cssText = 'position:fixed;top:60px;left:50%;transform:translateX(-50%);z-index:150;box-shadow:0 4px 16px rgba(0,0,0,.08);font-size:12.5px';
+    document.body.appendChild(bar);
+  }
+  bar.textContent = text;
+}
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function changeStatus(id, next, onDone) {
+  const label = { todo: '待办', doing: '进行中', done: '已完成', cancelled: '已取消' }[next] || next;
+  const moved = moveCardDom(id, next);
+
+  let task = null;
+  let version = null;
+  try {
+    const detail = await api(`/api/tasks/${id}`);
+    task = detail.task;
+    version = task.version;
+  } catch (e) {
+    // 连读取都失败：直接走重试也无法继续，回滚
+    if (moved) rollbackCard(id, moved.fromStatus);
+    toast(e.message, 'err');
+    return;
+  }
+
+  let lastErr = null;
+  for (let attempt = 0; attempt <= RETRY_DELAYS.length; attempt++) {
+    try {
+      const r = await api(`/api/tasks/${id}/status`, { body: { status: next, version } });
+      networkBanner(null);
+      toast('状态已更新 → ' + label, 'ok');
+      onDone && onDone();
+      return r;
+    } catch (e) {
+      lastErr = e;
+      // 409：别人先改了，用服务端的最新快照刷新，不再重试
+      if (e.status === 409) {
+        networkBanner(null);
+        toast(e.message, 'err');
+        onDone && onDone();
+        return null;
+      }
+      // 业务性拒绝（非法流转、需要原因、需要二次确认）：不该重试
+      if (e.status === 400) {
+        networkBanner(null);
+        toast(e.message, 'err');
+        if (moved) rollbackCard(id, moved.fromStatus);
+        return null;
+      }
+      if (attempt < RETRY_DELAYS.length) {
+        const wait = RETRY_DELAYS[attempt];
+        networkBanner(`网络不稳定，正在重试（${attempt + 1}/3，${wait / 1000} 秒后）`);
+        await sleep(wait);
+      }
+    }
+  }
+
+  // 三次全失败 → 回滚
+  networkBanner(null);
+  if (moved) rollbackCard(id, moved.fromStatus);
+  toast((lastErr && lastErr.message) || '网络异常，已回滚', 'err');
+  return null;
+}
+
+async function doNudge(gid, taskIds, onDone) {
+  try {
+    const r = await api(`/api/groups/${gid}/nudge`, { body: { task_ids: taskIds } });
+    await navigator.clipboard.writeText(r.card).catch(() => {});
+    openModal(`
+      <div class="modal-head"><h3>${esc(r.title)}</h3></div>
+      <div class="modal-body">
+        <div class="card card-pad" style="background:#F8F9F7;white-space:pre-wrap;font-size:13px;line-height:1.7;color:var(--ink-2)">${esc(r.card)}</div>
+        <p class="tiny muted mt8" style="margin-bottom:0">已复制到剪贴板，直接粘到微信群。同一任务 24 小时内只能催一次。</p>
+      </div>
+      <div class="modal-foot"><button class="btn btn-primary" data-close>好</button></div>`, {
+      onMount(m, close) { m.querySelector('[data-close]').onclick = close; },
+    });
+    onDone && onDone();
+  } catch (e) { toast(e.message, 'err'); }
+}
+
+/* =========================================================
+   列表视图
+   ========================================================= */
+async function listPage({ params }) {
+  if (!(await requireAuth())) return;
+  const gid = params.id;
+  state.currentGroupId = gid;
+  const [r, detail] = await Promise.all([api(`/api/groups/${gid}/tasks`), api(`/api/groups/${gid}`)]);
+  state.membersCache = Object.fromEntries(detail.members.map((m) => [m.user_id, m.nickname]));
+  const tasks = r.tasks;
+  const groups = [
+    ['已逾期', tasks.filter((t) => t.is_overdue)],
+    ['今天到期', tasks.filter((t) => !t.is_overdue && t.due_at && t.due_at <= nowMs())],
+    ['本周', tasks.filter((t) => !t.is_overdue && t.due_at && t.due_at > nowMs() && t.due_at <= nowMs() + 7 * 86400000)],
+    ['以后与无截止', tasks.filter((t) => !t.due_at || t.due_at > nowMs() + 7 * 86400000)],
+    ['已完成', tasks.filter((t) => t.status === 'done')],
+  ];
+  shell({
+    title: detail.group.name + ' · 列表',
+    activePath: `/g/${gid}/list`,
+    actions: `<button class="btn btn-sm btn-primary" id="add-task">＋ 新建任务</button>`,
+    body: groups.filter(([, items]) => items.length).map(([label, items]) => `
+      <div class="mt16">
+        <div class="row" style="margin-bottom:8px">
+          <h2 style="font-size:13px;margin:0;color:${label === '已逾期' ? 'var(--danger)' : 'var(--ink-2)'}">${label}</h2>
+          <span class="badge ${label === '已逾期' ? 'badge-danger' : ''}">${items.length}</span>
+        </div>
+        <div class="card" style="padding:5px">
+          ${items.map((t) => `
+            <div class="task-row ${t.priority === 'high' ? 'prio-high' : ''}" data-task="${t.id}">
+              <button class="task-check ${t.status === 'done' ? 'done' : ''}" data-check="${t.id}">${t.status === 'done' ? '✓' : ''}</button>
+              <div class="task-title ${t.status === 'done' ? 'done' : ''}">${esc(t.title)}</div>
+              <div class="task-meta">
+                ${t.assignee ? `<span class="tiny">${esc(t.assignee.nickname)}</span>` : '<span class="badge">待指派</span>'}
+                ${t.due_at ? `<span class="badge ${t.is_overdue ? 'badge-danger' : ''}">${t.is_overdue ? '逾期 ' + t.overdue_days + '天' : esc(t.due_label)}</span>` : ''}
+              </div>
+            </div>`).join('')}
+        </div>
+      </div>`).join('') || '<div class="card empty"><div class="empty-title">还没有任务</div><div class="small">把群里那句话粘进来，30 秒变成一条待办</div></div>',
+  });
+  document.getElementById('add-task').onclick = () => newTaskModal(gid, () => listPage({ params }));
+  app.querySelectorAll('[data-task]').forEach((b) => {
+    b.onclick = (e) => { if (!e.target.closest('[data-check]')) navigate(`/t/${b.dataset.task}`); };
+  });
+  app.querySelectorAll('[data-check]').forEach((b) => {
+    b.onclick = async (e) => {
+      e.stopPropagation();
+      const t = tasks.find((x) => x.id === b.dataset.check);
+      try {
+        await api(`/api/tasks/${t.id}/status`, { body: { status: t.status === 'done' ? 'todo' : 'done', reason: t.status === 'done' ? '取消勾选' : undefined } });
+        listPage({ params });
+      } catch (err) { toast(err.message, 'err'); }
+    };
+  });
+}
+
+/* =========================================================
+   文件 / 成员 / 设置
+   ========================================================= */
+async function filesPage({ params }) {
+  if (!(await requireAuth())) return;
+  const gid = params.id;
+  state.currentGroupId = gid;
+  const [r, detail] = await Promise.all([api(`/api/groups/${gid}/files`), api(`/api/groups/${gid}`)]);
+  const pct = r.storage.pct;
+  shell({
+    title: detail.group.name + ' · 文件',
+    activePath: `/g/${gid}/files`,
+    body: `
+      <div class="card card-pad">
+        <div class="row"><strong class="small">小组空间</strong><span class="spacer"></span>
+          <span class="tiny muted">${fmtSize(r.storage.used)} / ${fmtSize(r.storage.quota)}</span></div>
+        <div class="meter mt8 ${pct > 95 ? 'danger' : pct > 80 ? 'warn' : ''}"><i style="width:${Math.min(100, pct)}%"></i></div>
+        <div class="tiny muted mt8">文件挂在任务上，不单独做网盘。汇总时按任务找，不用翻聊天记录。</div>
+      </div>
+      <div class="card mt16">
+        <div class="card-head"><h2>全部文件</h2><span class="badge">${r.files.length}</span></div>
+        <div class="card-pad">
+          ${r.files.map((f) => `
+            <div class="file-item">
+              <span class="badge">${esc((f.filename.split('.').pop() || 'f').slice(0, 4))}</span>
+              <span class="n" title="${esc(f.filename)}">${esc(f.filename)}</span>
+              <span class="tiny muted nowrap" data-goto="${f.task_id}" style="cursor:pointer;color:var(--brand)">${esc(f.task_title)}</span>
+              <span class="tiny muted nowrap">${fmtSize(f.size)}</span>
+              <button class="btn btn-sm" data-dl="${f.id}">下载</button>
+            </div>`).join('') || '<div class="small muted">还没有文件。在任务详情页上传，文件会自动挂到那条任务下。</div>'}
+        </div>
+      </div>`,
+  });
+  app.querySelectorAll('[data-goto]').forEach((b) => { b.onclick = () => navigate(`/t/${b.dataset.goto}`); });
+  app.querySelectorAll('[data-dl]').forEach((b) => {
+    b.onclick = async () => {
+      const r2 = await api(`/api/attachments/${b.dataset.dl}/url`, { body: {} });
+      const a = document.createElement('a');
+      a.href = r2.url; a.click();
+    };
+  });
+}
+
+async function membersPage({ params, query }) {
+  if (!(await requireAuth())) return;
+  const gid = params.id;
+  state.currentGroupId = gid;
+  const detail = await api(`/api/groups/${gid}`);
+  state.membersCache = Object.fromEntries(detail.members.map((m) => [m.user_id, m.nickname]));
+  const isOwner = detail.group.role === 'owner';
+  shell({
+    title: detail.group.name + ' · 成员',
+    activePath: `/g/${gid}/members`,
+    actions: `<button class="btn btn-sm btn-primary" id="invite">邀请成员</button>`,
+    body: `
+      <div class="card">
+        <div class="card-head"><h2>成员</h2><span class="badge">${detail.members.length} / ${detail.group.max_members}</span><span class="spacer"></span>
+          <span class="tiny muted">点「加入」即可成为成员，不需要审批</span></div>
+        <div class="card-pad" style="padding-top:4px">
+          ${detail.members.map((m) => `
+            <div class="row" style="padding:9px 0;border-bottom:1px solid var(--line-2)">
+              ${avatarHtml({ nickname: m.nickname, avatar_color: m.avatar_color })}
+              <div style="flex:1;min-width:0">
+                <div class="small" style="font-weight:600">${esc(m.nickname)} ${m.role === 'owner' ? '<span class="badge badge-brand">组长</span>' : ''} ${m.user_id === (state.user && state.user.id) ? '<span class="badge">我</span>' : ''}</div>
+                <div class="tiny muted">本周完成 ${m.done_this_week} 件${m.last_active_at ? ' · 最后活跃 ' + fmtTime(m.last_active_at) : ''}</div>
+              </div>
+              ${isOwner && m.role !== 'owner' ? `<button class="btn btn-sm btn-danger" data-remove="${m.user_id}">移除</button>` : ''}
+            </div>`).join('')}
+        </div>
+      </div>
+      ${isOwner ? `
+      <div class="card mt16">
+        <div class="card-head"><h2>邀请链接</h2><span class="spacer"></span><span class="tiny muted">可多条并存，可一键全部失效</span></div>
+        <div class="card-pad">
+          ${detail.invites.length ? detail.invites.map((i) => `
+            <div class="row" style="padding:6px 0">
+              <input class="input mono tiny" value="${esc(location.origin + '/join/' + i.token)}" readonly>
+              <button class="btn btn-sm" data-copy="${esc(location.origin + '/join/' + i.token)}">复制</button>
+            </div>`).join('') : '<div class="small muted">还没有邀请链接</div>'}
+          <button class="btn mt12" id="new-invite">生成新链接</button>
+        </div>
+      </div>` : ''}
+      <div class="card mt16">
+        <div class="card-head"><h2>操作</h2></div>
+        <div class="card-pad">
+          ${isOwner ? `
+            <div class="row" style="gap:8px;flex-wrap:wrap">
+              <button class="btn btn-sm" id="transfer">转让组长</button>
+              <button class="btn btn-sm btn-danger" id="dissolve">解散小组</button>
+            </div>` : `
+            <button class="btn btn-sm btn-danger" id="leave">退出小组</button>`}
+          <p class="tiny muted mt8" style="margin-bottom:0">移除成员时，TA 名下的未完成任务会转交给组长；退出时任务保留但转为「待指派」。</p>
+        </div>
+      </div>`,
+  });
+
+  document.getElementById('invite').onclick = () => inviteModal(gid);
+  const ni = document.getElementById('new-invite');
+  if (ni) ni.onclick = () => inviteModal(gid);
+  app.querySelectorAll('[data-copy]').forEach((b) => {
+    b.onclick = async () => { await navigator.clipboard.writeText(b.dataset.copy); toast('链接已复制，去群里发一下吧', 'ok'); };
+  });
+  app.querySelectorAll('[data-remove]').forEach((b) => {
+    b.onclick = () => {
+      openModal(`
+        <div class="modal-head"><h3>移除成员</h3></div>
+        <div class="modal-body"><p class="small" style="margin:0">移除后，TA 名下的未完成任务会自动转交给你（组长）。</p></div>
+        <div class="modal-foot"><button class="btn" data-close>取消</button><button class="btn btn-danger" id="ok">移除</button></div>`, {
+        onMount(m, close) {
+          m.querySelector('[data-close]').onclick = close;
+          m.querySelector('#ok').onclick = async () => {
+            try {
+              const r = await api(`/api/groups/${gid}/members/${b.dataset.remove}/remove`, { body: {} });
+              close(); toast(`已移除，${r.transferred} 个任务已转交`, 'ok'); membersPage({ params });
+            } catch (e) { toast(e.message, 'err'); }
+          };
+        },
+      });
+    };
+  });
+  const leave = document.getElementById('leave');
+  if (leave) leave.onclick = async () => {
+    try {
+      const r = await api(`/api/groups/${gid}/leave`, { body: {} });
+      toast(`已退出，${r.released} 个任务转为待指派`, 'ok');
+      await loadGroups();
+      navigate('/my');
+    } catch (e) { toast(e.message, 'err'); }
+  };
+  const tr = document.getElementById('transfer');
+  if (tr) tr.onclick = () => {
+    const others = detail.members.filter((m) => m.role !== 'owner');
+    if (!others.length) return toast('小组里还没有其他成员', 'err');
+    openModal(`
+      <div class="modal-head"><h3>把组长转让给谁</h3></div>
+      <div class="modal-body">
+        ${others.map((m) => `<button class="btn btn-block" style="justify-content:flex-start;margin-bottom:6px" data-to="${m.user_id}">${esc(m.nickname)}</button>`).join('')}
+      </div>
+      <div class="modal-foot"><button class="btn" data-close>取消</button></div>`, {
+      onMount(m, close) {
+        m.querySelector('[data-close]').onclick = close;
+        m.querySelectorAll('[data-to]').forEach((b) => {
+          b.onclick = async () => {
+            try { await api(`/api/groups/${gid}/transfer`, { body: { user_id: b.dataset.to } }); close(); toast('已转让', 'ok'); membersPage({ params }); }
+            catch (e) { toast(e.message, 'err'); }
+          };
+        });
+      },
+    });
+  };
+  const dis = document.getElementById('dissolve');
+  if (dis) dis.onclick = () => {
+    openModal(`
+      <div class="modal-head"><h3>解散小组</h3></div>
+      <div class="modal-body">
+        <p class="small" style="margin:0 0 10px">解散后全部任务转为只读，<strong>30 天后彻底删除</strong>。现在可以先导出。</p>
+        <button class="btn btn-sm" id="exp">导出全部任务（CSV）</button>
+      </div>
+      <div class="modal-foot"><button class="btn" data-close>算了</button><button class="btn btn-danger" id="ok">确定解散</button></div>`, {
+      onMount(m, close) {
+        m.querySelector('[data-close]').onclick = close;
+        m.querySelector('#exp').onclick = () => exportCsv(gid);
+        m.querySelector('#ok').onclick = async () => {
+          try { const r = await api(`/api/groups/${gid}/dissolve`, { body: {} }); close(); toast(r.message, 'ok'); await loadGroups(); navigate('/my'); }
+          catch (e) { toast(e.message, 'err'); }
+        };
+      },
+    });
+  };
+  if (query && query.invite) setTimeout(() => inviteModal(gid), 200);
+}
+
+async function exportCsv(gid) {
+  const r = await api(`/api/groups/${gid}/export`);
+  const blob = new Blob([r.csv], { type: 'text/csv;charset=utf-8' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = r.filename;
+  a.click();
+  toast('已导出', 'ok');
+}
+
+function inviteModal(gid) {
+  openModal(`
+    <div class="modal-head"><h3>邀请成员</h3></div>
+    <div class="modal-body">
+      <p class="small muted" style="margin:0 0 12px">生成一个链接发到微信群。组员点开、登录、点「加入」，就进组了。</p>
+      <div class="field">
+        <label>链接有效期</label>
+        <select class="select" id="days">
+          <option value="0">永久有效</option>
+          <option value="7">7 天</option>
+          <option value="30">30 天</option>
+        </select>
+      </div>
+      <div id="out"></div>
+    </div>
+    <div class="modal-foot"><button class="btn" data-close>关闭</button><button class="btn btn-primary" id="gen">生成链接</button></div>`, {
+    onMount(m, close) {
+      m.querySelector('[data-close]').onclick = close;
+      m.querySelector('#gen').onclick = async () => {
+        try {
+          const r = await api(`/api/groups/${gid}/invites`, { body: { expire_days: Number(m.querySelector('#days').value) } });
+          const url = location.origin + r.url;
+          m.querySelector('#out').innerHTML = `
+            <div class="row"><input class="input mono tiny" id="iv" value="${esc(url)}" readonly>
+              <button class="btn btn-sm btn-primary" id="cp">复制</button></div>
+            <div class="hint">${r.expire_at ? '这个链接会过期，过期后需重新生成' : '永久有效，可随时在成员页一键失效'}</div>`;
+          m.querySelector('#cp').onclick = async () => { await navigator.clipboard.writeText(url); toast('链接已复制，去群里发一下吧', 'ok'); };
+        } catch (e) { toast(e.message, 'err'); }
+      };
+    },
+  });
+}
+
+/* =========================================================
+   设置 / 通知 / 付费
+   ========================================================= */
+async function settingsPage() {
+  if (!(await requireAuth())) return;
+  const [r, gs] = await Promise.all([refreshUnread(), api('/api/groups')]);
+  const groups = (gs && gs.groups) || [];   // 接口返回 { groups: [...] }，别把整个响应当数组用
+  const p = state.user.notify_prefs || {};
+  shell({
+    title: '通知与账号',
+    activePath: '/settings',
+    body: `
+      <div class="card">
+        <div class="card-head"><h2>提醒</h2><span class="spacer"></span><span class="tiny muted">默认每天一条汇总</span></div>
+        <div class="card-pad">
+          <div class="switch"><input type="checkbox" id="p-daily" ${p.daily !== false ? 'checked' : ''}><label for="p-daily">每日 08:30 汇总今天到期的任务</label></div>
+          <div class="switch"><input type="checkbox" id="p-urgent" ${p.urgent !== false ? 'checked' : ''}><label for="p-urgent">高优先级任务在到期前 24 小时 / 2 小时提醒</label></div>
+          <div class="switch"><input type="checkbox" id="p-overdue" ${p.overdue !== false ? 'checked' : ''}><label for="p-overdue">逾期任务次日 09:00 提醒一次</label></div>
+          <div class="banner mt12" style="background:var(--brand-soft);border-color:#CFE0DA;color:var(--brand)">
+            <span>不打开网页也不会漏：把任务同步到手机系统日历，到点手机会自己响。</span>
+          </div>
+          <div class="row mt12" style="gap:8px;flex-wrap:wrap">
+            ${groups.map((g) => `<button class="btn btn-sm" data-ics="${g.id}">${esc(g.name)} 加入日历</button>`).join('')}
+          </div>
+          <p class="tiny muted mt8" style="margin-bottom:0">这是本产品最可靠的提醒方式：.ics 订阅写进系统日历，不依赖微信、不依赖打开网页。</p>
+        </div>
+      </div>
+
+      <div class="card mt16">
+        <div class="card-head"><h2>账号</h2></div>
+        <div class="card-pad">
+          <div class="field"><label>昵称</label><input class="input" id="nick" value="${esc(state.user.nickname)}" maxlength="20"></div>
+          <div class="field"><label>邮箱（可选，用于备用提醒）</label><input class="input" id="email" value="${esc(state.user.email || '')}" placeholder="you@example.com"></div>
+          <div class="kv"><span class="k">手机号</span><span class="v mono">${esc(state.user.phone_masked)}</span></div>
+          <div class="row mt12"><button class="btn btn-primary btn-sm" id="save-me">保存</button></div>
+        </div>
+      </div>
+
+      <div class="card mt16">
+        <div class="card-head"><h2>站内提醒记录</h2><span class="spacer"></span><span class="badge">${r.unread} 未读</span></div>
+        <div class="card-pad" style="padding-top:4px">
+          ${r.items.length ? r.items.map((n) => `
+            <div class="act">
+              <div style="flex:1;min-width:0">
+                <div class="small ${n.read_at ? 'muted' : ''}" style="font-weight:${n.read_at ? 400 : 600}">${esc(n.payload.title || n.type)}</div>
+                <div class="tiny muted">${esc(n.type)} · ${fmtTime(n.sent_at)}</div>
+              </div>
+              ${n.task_id ? `<button class="btn btn-sm" data-open="${n.task_id}">查看</button>` : ''}
+            </div>`).join('') : '<div class="small muted">还没有提醒。任务到期前会有汇总。</div>'}
+        </div>
+      </div>
+
+      <div class="card mt16">
+        <div class="card-head"><h2>危险操作</h2></div>
+        <div class="card-pad">
+          <button class="btn btn-sm btn-danger" id="del-acc">注销账号</button>
+          <p class="tiny muted mt8" style="margin-bottom:0">注销后，你创建的 {{n}} 个小组将转交或解散，且无法恢复。</p>
+        </div>
+      </div>`,
+  });
+
+  const savePrefs = async () => {
+    await api('/api/me', {
+      method: 'PATCH',
+      body: {
+        notify_prefs: {
+          daily: document.getElementById('p-daily').checked,
+          urgent: document.getElementById('p-urgent').checked,
+          overdue: document.getElementById('p-overdue').checked,
+        },
+      },
+    });
+  };
+  ['p-daily', 'p-urgent', 'p-overdue'].forEach((id) => {
+    document.getElementById(id).onchange = async () => { await savePrefs(); toast('已保存', 'ok'); };
+  });
+  document.getElementById('save-me').onclick = async () => {
+    try {
+      const r2 = await api('/api/me', {
+        method: 'PATCH',
+        body: { nickname: document.getElementById('nick').value, email: document.getElementById('email').value },
+      });
+      state.user = r2.user;
+      toast('已保存', 'ok');
+    } catch (e) { toast(e.message, 'err'); }
+  };
+  app.querySelectorAll('[data-ics]').forEach((b) => {
+    b.onclick = async () => {
+      const res = await fetch(`/api/groups/${b.dataset.ics}/ics`, { headers: { authorization: `Bearer ${state.token}` } });
+      const blob = await res.blob();
+      const a = document.createElement('a');
+      a.href = URL.createObjectURL(blob);
+      a.download = 'qingdui.ics';
+      a.click();
+      toast('已下载，双击导入手机日历', 'ok');
+    };
+  });
+  app.querySelectorAll('[data-open]').forEach((b) => { b.onclick = () => navigate(`/t/${b.dataset.open}`); });
+  document.getElementById('del-acc').onclick = () => {
+    openModal(`
+      <div class="modal-head"><h3>注销账号</h3></div>
+      <div class="modal-body"><p class="small" style="margin:0">注销后你创建的小组会被归档，所有成员关系解除，<strong>无法恢复</strong>。</p></div>
+      <div class="modal-foot"><button class="btn" data-close>算了</button><button class="btn btn-danger" id="ok">确定注销</button></div>`, {
+      onMount(m, close) {
+        m.querySelector('[data-close]').onclick = close;
+        m.querySelector('#ok').onclick = async () => {
+          try { await api('/api/me/delete', { body: {} }); setToken(''); close(); toast('已注销'); navigate('/login'); }
+          catch (e) { toast(e.message, 'err'); }
+        };
+      },
+    });
+  };
+}
+
+function notificationsModal() {
+  refreshUnread().then((r) => {
+    openModal(`
+      <div class="modal-head"><h3>提醒</h3><span class="spacer"></span>
+        <button class="btn btn-sm" id="read-all">全部已读</button></div>
+      <div class="modal-body" style="max-height:60vh;overflow:auto">
+        ${r.items.length ? r.items.map((n) => `
+          <div class="act" style="cursor:pointer" data-open="${n.task_id || ''}">
+            <div style="flex:1;min-width:0">
+              <div class="small" style="font-weight:${n.read_at ? 400 : 600}">${esc(n.payload.title || n.type)}</div>
+              <div class="tiny muted">${esc(n.type)} · ${fmtTime(n.sent_at)}</div>
+            </div>
+          </div>`).join('') : '<div class="small muted" style="padding:14px 0">还没有提醒。每天 08:30 会有一条汇总，逾期任务次日 09:00 单独提醒。</div>'}
+      </div>
+      <div class="modal-foot"><button class="btn" data-close>关闭</button></div>`, {
+      onMount(m, close) {
+        m.querySelector('[data-close]').onclick = close;
+        m.querySelector('#read-all').onclick = async () => { await api('/api/notifications/read', { body: {} }); state.unread = 0; close(); render(); };
+        m.querySelectorAll('[data-open]').forEach((b) => {
+          if (!b.dataset.open) return;
+          b.onclick = () => { close(); navigate(`/t/${b.dataset.open}`); };
+        });
+      },
+    });
+  });
+}
+
+async function planPage() {
+  if (!(await requireAuth())) return;
+  const p = await api('/api/plan');
+  const g = state.groups[0];
+  shell({
+    title: '高级版',
+    activePath: '/plan',
+    body: `
+      <div class="card card-pad" style="background:linear-gradient(135deg,#2F5D50,#3D7868);color:#fff;border:none">
+        <div style="font-size:11px;letter-spacing:2px;opacity:.7">QINGDUI PRO</div>
+        <h2 style="margin:6px 0 4px;font-size:23px;letter-spacing:-.5px">${esc(p.subtitle)}</h2>
+        <p style="margin:0;opacity:.82;font-size:13.5px">¥19 / 组 / 月，或 ¥168 / 组 / 学期。按组计价，组员不用付钱。</p>
+      </div>
+      <div class="card mt16">
+        <div class="card-head"><h2>免费版 vs 高级版</h2></div>
+        <div class="card-pad">
+          <table style="width:100%;border-collapse:collapse;font-size:13.5px">
+            <tr style="color:var(--ink-4);font-size:12px"><th align="left" style="padding:6px 0">能力</th><th align="left">免费</th><th align="left">高级</th></tr>
+            ${[
+              ['小组总空间', '500MB', '2GB'],
+              ['单文件上限', '20MB', '100MB'],
+              ['历史版本', '只留 3 个', '全部'],
+              ['导出 CSV 周报', '可以', '可以'],
+              ['成员上限', '8 人', '30 人'],
+              ['同时在用小组', '3 个', '10 个'],
+              ['品牌水印', '有', '无'],
+            ].map(([k, f, v]) => `<tr style="border-top:1px solid var(--line-2)"><td style="padding:9px 0">${k}</td><td class="muted">${f}</td><td style="font-weight:600">${v}</td></tr>`).join('')}
+          </table>
+        </div>
+      </div>
+      <div class="card mt16">
+        <div class="card-head"><h2>付费</h2></div>
+        <div class="card-pad">
+          ${g ? `
+            <div class="row" style="gap:8px;flex-wrap:wrap">
+              <button class="btn btn-primary" data-buy="month">升级 ¥19 / 月</button>
+              <button class="btn btn-primary" data-buy="year">升级 ¥168 / 学期</button>
+            </div>
+            <p class="tiny muted mt8" style="margin-bottom:0">升级对象：${esc(g.name)}（${g.plan === 'pro' ? '已是高级版' : '当前免费版'}）· ${esc(p.refund)}</p>` : '<div class="small muted">先建一个小组再来升级。</div>'}
+        </div>
+      </div>`,
+  });
+  app.querySelectorAll('[data-buy]').forEach((b) => {
+    b.onclick = async () => {
+      if (!g) return;
+      try {
+        await api(`/api/groups/${g.id}/upgrade`, { body: { cycle: b.dataset.buy } });
+        toast('已升级。这是一次本地演示，没有真实扣款', 'ok');
+        await loadGroups();
+        planPage();
+      } catch (e) { toast(e.message, 'err'); }
+    };
+  });
+}
+
+function paywallModal({ trigger, message, exits = ['upgrade'] }) {
+  openModal(`
+    <div class="modal-head"><h3>你已用到免费版上限</h3></div>
+    <div class="modal-body">
+      <p class="small" style="margin:0 0 12px">${esc(message || '')}</p>
+      <div class="card card-pad" style="background:#F8F9F7">
+        <div class="small" style="font-weight:600">升级到高级版后</div>
+        <div class="tiny muted mt4">500MB → 2GB 空间 · 单文件 20MB → 100MB · 历史版本全保留 · 成员上限 8 → 30 人</div>
+        <div class="small mt8" style="font-weight:600">¥19 / 组 / 月，或 ¥168 / 组 / 学期</div>
+      </div>
+    </div>
+    <div class="modal-foot">
+      ${exits.includes('cleanup') ? '<button class="btn" data-cleanup>去清理文件</button>' : ''}
+      ${exits.includes('archive') ? '<button class="btn" data-archive>归档一个小组</button>' : ''}
+      <button class="btn" data-close>再看看</button>
+      ${exits.includes('upgrade') ? '<button class="btn btn-primary" data-upgrade>看高级版</button>' : ''}
+    </div>`, {
+    onMount(m, close) {
+      m.querySelector('[data-close]').onclick = close;
+      const up = m.querySelector('[data-upgrade]');
+      if (up) up.onclick = () => { close(); navigate('/plan'); };
+      const cl = m.querySelector('[data-cleanup]');
+      if (cl) cl.onclick = () => { close(); if (state.currentGroupId) navigate(`/g/${state.currentGroupId}/files`); };
+      const ar = m.querySelector('[data-archive]');
+      if (ar) ar.onclick = () => { close(); navigate('/my'); };
+    },
+  });
+}
+
+/* =========================================================
+   分享页（免登录，PRD 7.9）
+   ========================================================= */
+async function sharePage({ params }) {
+  let d;
+  try {
+    d = await api(`/api/share/${params.token}`);
+  } catch (e) {
+    app.innerHTML = `
+      <div class="share-wrap">
+        <div class="share-top"><div class="brand-mark">轻</div><span class="brand-name">轻队</span></div>
+        <div class="share-main">
+          <div class="card card-pad share-card center" style="padding:38px 24px">
+            <div style="font-size:17px;font-weight:650;margin-bottom:8px">该任务已关闭</div>
+            <p class="small muted" style="margin:0 0 20px">链接可能已过期，或者组长撤销了分享。</p>
+            <a class="btn btn-primary" href="/login">我也要建一个小组</a>
+          </div>
+        </div>
+      </div>`;
+    return;
+  }
+
+  const t = d.task;
+  const canClaim = d.viewer.logged_in && !t.assignee && !d.viewer.is_member;
+  const claimOrLogin = d.viewer.logged_in
+    ? (!t.assignee ? `<button class="claim-btn" id="claim">认领这件事</button>` : `<button class="claim-btn" disabled>已由 ${esc(t.assignee.nickname)} 负责</button>`)
+    : `<button class="claim-btn" id="login-claim">认领这件事</button>`;
+
+  app.innerHTML = `
+    <div class="share-wrap">
+      <div class="share-top">
+        <div class="brand-mark">轻</div>
+        <span class="brand-name">轻队</span>
+        <span class="spacer" style="flex:1"></span>
+        <span class="tiny muted">${esc(d.group.name)} · ${d.group.members} 人</span>
+      </div>
+      <div class="share-main">
+        <div class="share-card">
+          <div class="card card-pad">
+            <div class="row" style="gap:6px;margin-bottom:10px;flex-wrap:wrap">
+              <span class="badge ${t.status === 'done' ? 'badge-ok' : t.status === 'doing' ? 'badge-brand' : 'badge-warn'}">${esc(t.status_label)}</span>
+              ${t.is_overdue ? `<span class="badge badge-danger">已逾期 ${t.overdue_days} 天</span>` : ''}
+              ${t.priority === 'high' ? '<span class="badge badge-danger">高优先级</span>' : ''}
+            </div>
+            <div class="share-hero">${esc(t.title)}</div>
+            ${t.description ? `<div class="small" style="white-space:pre-wrap;color:var(--ink-2);line-height:1.7;margin-bottom:14px">${esc(t.description)}</div>` : ''}
+            <div style="border-top:1px solid var(--line-2);padding-top:12px">
+              <div class="kv"><span class="k">责任人</span><span class="v row" style="gap:6px">${t.assignee ? avatarHtml(t.assignee) + '<span style="font-weight:600">' + esc(t.assignee.nickname) + '</span>' : '<span class="badge">待指派</span>'}</span></div>
+              <div class="kv"><span class="k">截止</span><span class="v" style="font-weight:600;${t.is_overdue ? 'color:var(--danger)' : ''}">${esc(t.due_label || '无截止')}</span></div>
+              ${d.attachments.length ? `<div class="kv"><span class="k">附件</span><span class="v small muted">${d.attachments.map((f) => esc(f.filename)).join('、')}（登录后可下载）</span></div>` : ''}
+            </div>
+          </div>
+          <div class="mt16">${claimOrLogin}</div>
+          <p class="tiny center muted mt12" style="margin-bottom:0">${esc(d.value_prop)}</p>
+          <div class="center mt16">
+            <a class="tiny muted" href="/login">我也要建一个小组</a>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+  const claimBtn = document.getElementById('claim');
+  if (claimBtn) {
+    claimBtn.onclick = async () => {
+      try {
+        const r = await api(`/api/tasks/${t.id}/claim`, { body: {} });
+        toast(r.message, 'ok');
+        sharePage({ params });
+      } catch (e) {
+        if (e.status === 401) {
+          sessionStorage.setItem('qd_pending', JSON.stringify({ path: '/s/' + params.token, action: 'claim', taskId: t.id }));
+          navigate('/login?next=' + encodeURIComponent('/s/' + params.token));
+        } else toast(e.message, 'err');
+      }
+    };
+  }
+  const lc = document.getElementById('login-claim');
+  if (lc) {
+    lc.onclick = () => {
+      // PRD 11.1 AC-02：登录后回到原任务并自动认领
+      sessionStorage.setItem('qd_pending', JSON.stringify({ path: '/s/' + params.token, action: 'claim', taskId: t.id }));
+      navigate('/login?next=' + encodeURIComponent('/s/' + params.token));
+    };
+  }
+}
+
+/* =========================================================
+   邀请加入页
+   ========================================================= */
+async function joinPage({ params }) {
+  let d;
+  try {
+    d = await api(`/api/invites/${params.token}`);
+  } catch (e) {
+    app.innerHTML = `<div class="auth-wrap"><div class="auth-card card card-pad center">
+      <div style="font-size:17px;font-weight:650;margin-bottom:8px">${esc(e.message)}</div>
+      <a class="btn" href="/">回到首页</a></div></div>`;
+    return;
+  }
+  app.innerHTML = `
+    <div class="auth-wrap">
+      <div class="auth-card">
+        <div class="brand" style="border:none;padding:0 0 18px"><div class="brand-mark">轻</div>
+          <div><div class="brand-name">轻队</div><div class="brand-sub">QingDui</div></div></div>
+        <div class="card card-pad center">
+          <p class="small muted" style="margin:0 0 6px">你被邀请加入</p>
+          <h2 style="margin:0 0 4px;font-size:21px;letter-spacing:-.4px">${esc(d.group.name)}</h2>
+          <p class="small muted" style="margin:0 0 20px">${d.group.members} 位成员 · 加入后能看到小组的所有任务</p>
+          <button class="btn btn-primary btn-lg btn-block" id="join">${d.already_member ? '进入小组' : '加入这个小组'}</button>
+          <p class="tiny muted mt12" style="margin-bottom:0">微信群负责说，轻队负责记住谁什么时候交</p>
+        </div>
+      </div>
+    </div>`;
+  document.getElementById('join').onclick = async () => {
+    if (!state.token) {
+      navigate('/login?next=' + encodeURIComponent('/join/' + params.token));
+      return;
+    }
+    if (!state.user) await loadMe();
+    try {
+      const r = await api(`/api/invites/${params.token}/join`, { body: {} });
+      await loadGroups();
+      state.currentGroupId = r.group_id;
+      toast(r.already_member ? '你已经在组里了' : '加入成功', 'ok');
+      navigate(`/g/${r.group_id}/board`);
+    } catch (e) {
+      if (e.status === 401) navigate('/login?next=' + encodeURIComponent('/join/' + params.token));
+      else toast(e.message, 'err');
+    }
+  };
+}
+
+/* =========================================================
+   路由表
+   ========================================================= */
+route('/s/:token', sharePage);
+route('/join/:token', joinPage);
+route('/t/:id', taskPage);
+route('/g/:id/board', boardPage);
+route('/g/:id/list', listPage);
+route('/g/:id/files', filesPage);
+route('/g/:id/members', membersPage);
+route('/g/:id/settings', membersPage);
+route('/g/:id', ({ params }) => navigate(`/g/${params.id}/board`, { replace: true }));
+route('/settings', settingsPage);
+route('/plan', planPage);
+
+window.addEventListener('popstate', render);
+
+// 启动
+(async function boot() {
+  await loadMe();
+  if (!state.user && state.token) setToken('');
+  render();
+})();
+
+// 供测试使用
+window.__qd = { state, api, navigate, render, loadGroups };
