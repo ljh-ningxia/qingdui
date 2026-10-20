@@ -24,7 +24,9 @@ uploads/
 
 # ---- 依赖与构建产物（本项目零依赖，仅作防御）----
 node_modules/
-dist/
+# dist/ 例外：托管部署需要 dist/index.html（自包含前端）直接可用
+dist/*
+!dist/index.html
 build/
 
 # ---- 编辑器与系统 ----
