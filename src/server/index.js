@@ -162,9 +162,9 @@ function createServer() {
   });
 }
 
-module.exports = { createServer, handle };
+module.exports = { createServer, handle, start };
 
-if (require.main === module) {
+function start() {
   const port = Number(process.env.PORT || process.env.QD_PORT || process.argv[2] || 3001);
   // 部署到托管平台时需要监听 0.0.0.0；本地开发默认只绑回环地址更安全。
   const host = process.env.QD_HOST || (process.env.PORT ? '0.0.0.0' : '127.0.0.1');
@@ -187,4 +187,7 @@ if (require.main === module) {
   };
   process.on('SIGINT', shutdown);
   process.on('SIGTERM', shutdown);
+  return server;
 }
+
+if (require.main === module) start();
