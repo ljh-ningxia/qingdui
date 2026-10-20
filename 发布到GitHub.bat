@@ -2,10 +2,30 @@
 setlocal enabledelayedexpansion
 cd /d "%~dp0"
 
+rem ---- inject tool paths (git is bundled, gh installed to user dir) ----
+set "PATH=%PATH%;C:\Users\Administrator\.local\bin"
+set "PATH=%PATH%;D:\jiqishijue\WorkBuddy\resources\vendor\PortableGit\mingw64\bin"
+set "PATH=%PATH%;D:\jiqishijue\WorkBuddy\resources\vendor\PortableGit\cmd"
+
 echo.
 echo ============================================
 echo   QingDui - Publish to GitHub [PRIVATE]
 echo ============================================
+echo.
+
+where git >nul 2>nul
+if errorlevel 1 (
+  echo [!] git not found even after path injection. Contact assistant.
+  pause
+  exit /b 1
+)
+where gh >nul 2>nul
+if errorlevel 1 (
+  echo [!] gh not found at C:\Users\Administrator\.local\bin\gh.exe
+  pause
+  exit /b 1
+)
+echo   [OK] git and gh found
 echo.
 
 set "REPO=qingdui"
@@ -14,7 +34,7 @@ if not "!INPUT!"=="" set "REPO=!INPUT!"
 
 set "OWNER="
 for /f "delims=" %%i in ('git config user.name') do set "OWNER=%%i"
-if "!OWNER!"=="" set "OWNER=your-github-username"
+if "!OWNER!"=="" set "OWNER=xingxingdemi"
 
 set "FULLNAME=!OWNER!/!REPO!"
 
@@ -26,9 +46,6 @@ echo     GitHub.com  -^>  HTTPS  -^>  Login with a web browser
 echo   Then type the one-time code shown, and click Authorize.
 echo.
 pause
-
-where gh >nul 2>nul
-if errorlevel 1 goto NOGH
 
 gh auth status >nul 2>nul
 if errorlevel 1 (
@@ -63,21 +80,6 @@ start "" "https://github.com/!FULLNAME!"
 pause
 exit /b 0
 
-:NOGH
-echo.
-echo [!] gh CLI not found.
-echo     Plan B - create the repo by hand:
-echo       1. Open https://github.com/new
-echo       2. Repository name: !REPO!
-echo       3. Select PRIVATE
-echo       4. Do NOT tick "Add a README"
-echo       5. Create, then run:
-echo          git remote add origin https://github.com/!FULLNAME!.git
-echo          git push -u origin main
-echo.
-pause
-exit /b 1
-
 :LOGINFAIL
 echo.
 echo [x] Login was not completed. Aborted.
@@ -86,9 +88,8 @@ exit /b 1
 
 :CREATEFAIL
 echo.
-echo [!] Repo creation failed - the name may already be taken.
-echo     Pick another name, or create an empty repo manually then run:
-echo       git remote add origin https://github.com/!FULLNAME!.git
-echo       git push -u origin main
+echo [!] Repo creation failed - the name may already be taken,
+echo     or the network blocked github.com.
+echo     Retry, or pick another name.
 pause
 exit /b 1
