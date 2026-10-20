@@ -17,6 +17,10 @@ uploads/
 .env
 .env.*
 !.env.example
+# 本地开发自动生成的会话密钥（secrets.js 创建），绝不可入库
+.qd-dev-secret
+*.pem
+*.key
 
 # ---- 依赖与构建产物（本项目零依赖，仅作防御）----
 node_modules/

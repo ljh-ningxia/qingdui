@@ -60,6 +60,22 @@ function requireOwner(groupId, userId) {
   return ctx;
 }
 
+/**
+ * C4 修复：按 group_id 直接判定只读，供路由层统一调用。
+ *
+ * 原做法是手工在个别 handler 里插 assertWritable，漏一个就漏一个洞
+ * （实测改名 / 发邀请 / 升级在解散后仍返回 200）。现在由派发层统一拦截，
+ * 新增路由不需要记得加这一句。
+ *
+ * 组不存在时放行，交给后续 handler 返回 404 —— 这里只负责"已解散则禁写"。
+ */
+function assertGroupWritable(groupId) {
+  if (!groupId) return true;
+  const g = one('SELECT id, status, deleted_at FROM groups WHERE id = ?', String(groupId));
+  if (g) assertWritable(g);
+  return true;
+}
+
 function planOf(group) {
   return PLAN[group.plan] || PLAN.free;
 }
@@ -208,4 +224,5 @@ module.exports = {
   membershipOf, getGroup, requireMember, requireOwner, planOf, membersOf, publicUser,
   logActivity, notify, taskWithMeta, getTask, canEdit, canChangeStatus, canDeleteTask,
   applyStatusChange, nextAvatarColor, touchGroup, safeJson, AVATAR_COLORS, assertWritable,
+  assertGroupWritable,
 };

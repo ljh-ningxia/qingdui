@@ -1,4 +1,4 @@
-// 一键跑完全部测试：30 条 PRD 验收 + 前端冒烟
+// 一键跑完全部测试：30 条 PRD 验收 + 前端冒烟 + 7 条安全回归
 // 用法：node tests/all.js
 const { execFileSync } = require('node:child_process');
 const path = require('node:path');
@@ -7,6 +7,7 @@ const node = process.execPath;
 const files = [
   ['PRD 11.1 验收测试（AC-01 ~ AC-30）', 'acceptance.test.js'],
   ['前端冒烟测试（真实执行 app.js）', 'ui.test.js'],
+  ['安全回归测试（C1 ~ C7 漏洞复现验证）', 'security.test.js'],
 ];
 
 let failed = 0;

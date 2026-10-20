@@ -3,7 +3,8 @@ const path = require('node:path');
 const fs = require('node:fs');
 const os = require('node:os');
 
-process.env.QD_SECRET = 'test-secret-qingdui';
+// C1 修复后密钥有最小长度要求（32 字符），测试用一个固定的长密钥
+process.env.QD_SECRET = 'test-secret-qingdui-0123456789abcdef-固定测试密钥';
 process.env.QD_DEV_CODE = '1';
 // 测试必须用内存库：否则会读到 data/qingdui.db 里的历史数据，
 // 撞上「免费版 3 个小组」之类的业务上限，让用例互相污染。

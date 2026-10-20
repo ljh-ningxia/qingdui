@@ -1,9 +1,11 @@
 // 手机号加密（PRD 12：安全 — 手机号加密存储）
 // AES-256-GCM + HMAC 盲索引（用于登录时查找，不解密全表）
 const crypto = require('node:crypto');
+const { dataKey, indexKey } = require('./secrets');
 
-const KEY = crypto.createHash('sha256').update(process.env.QD_SECRET || 'qingdui-local-dev-secret').digest();
-const IDX_KEY = crypto.createHash('sha256').update((process.env.QD_SECRET || 'qingdui-local-dev-secret') + ':idx').digest();
+// C1 修复：密钥统一由 secrets.js 提供，不再有源码内公开兜底值
+const KEY = dataKey();
+const IDX_KEY = indexKey();
 
 function encryptPhone(phone) {
   const iv = crypto.randomBytes(12);

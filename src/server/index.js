@@ -5,6 +5,7 @@ const R = require('./router');
 const { AppError } = require('./errors');
 const S = require('./session');
 const { openDb } = require('./db');
+const Dom = require('./domain');
 require('./api'); // 注册全部路由
 
 const WEB_DIR = path.join(__dirname, '..', 'web');
@@ -104,6 +105,13 @@ async function handle(req, res) {
       }
     }
 
+    // C4 修复：解散后 30 天只读窗口由派发层统一兜底。
+    // 所有 /api/groups/:id/** 的非 GET 请求，先判组是否 archived，再进 handler。
+    // 这样新增的群组写接口不可能再因为"忘了加断言"而漏掉。
+    if (req.method !== 'GET' && req.method !== 'HEAD' && params.id) {
+      Dom.assertGroupWritable(params.id);
+    }
+
     const result = await route.handler(ctx);
 
     if (ctx.raw) {
@@ -161,5 +169,20 @@ if (require.main === module) {
   const server = createServer();
   server.listen(port, '127.0.0.1', () => {
     console.log(`轻队 QingDui 已启动： http://127.0.0.1:${port}`);
+    // C6 修复：真正把提醒与清理跑起来。
+    // QD_SCHEDULER=0 可在需要纯净环境（如演示、性能压测）时关掉。
+    if (process.env.QD_SCHEDULER !== '0') {
+      require('./scheduler').start();
+      console.log('后台调度已启动：提醒每分钟一次，解散清理每小时一次');
+    } else {
+      console.log('后台调度已关闭（QD_SCHEDULER=0）');
+    }
   });
+  const shutdown = () => {
+    try { require('./scheduler').stop(); } catch { /* ignore */ }
+    server.close(() => process.exit(0));
+    setTimeout(() => process.exit(0), 3000).unref();
+  };
+  process.on('SIGINT', shutdown);
+  process.on('SIGTERM', shutdown);
 }

@@ -298,8 +298,12 @@ const t13 = test('AC-13 免费组空间已用 495MB，上传 10MB → 失败，�
   });
   S.run('UPDATE groups SET storage_used_bytes = ? WHERE id = ?', 495 * 1024 * 1024, g.id);
 
+  // 造一个真实超过剩余配额的文件。
+  // 免费组 495MB / 500MB，剩 5MB —— 传 6MB 真实内容必然被拒。
+  // 注：C5 修复后判定看真实字节，不再看声明的 size。
+  const big = Buffer.alloc(6 * 1024 * 1024, 0x41);
   const r = await u.client.post(`/api/tasks/${t.id}/files`, {
-    filename: 'big.pdf', size: 10 * 1024 * 1024, mime: 'application/pdf', data_b64: 'AAAA',
+    filename: 'big.bin', size: 6 * 1024 * 1024, mime: 'application/octet-stream', data_b64: big.toString('base64'),
   });
   eq(r.status, 402, '上传被拒');
   eq(r.data.error.trigger, 'storage', '触发原因是空间');
@@ -498,11 +502,11 @@ const t23 = test('AC-23 同一文件第二次上传 → 归入同一 file_group�
   const t = await S.makeTask(u.client, g.id, { title: '要改稿的文件' });
   const a1 = await u.client.post(`/api/tasks/${t.id}/files`, {
     filename: '报告.docx', size: 10, mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    data_b64: Buffer.from('v1').toString('base64'),
+    data_b64: Buffer.from('version-one-content!').toString('base64'),
   });
   const a2 = await u.client.post(`/api/tasks/${t.id}/files`, {
     filename: '报告.docx', size: 20, mime: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
-    data_b64: Buffer.from('v2v2').toString('base64'),
+    data_b64: Buffer.from('version-two-content-is-longer!!').toString('base64'),
   });
   eq(a2.data.file_group_id, a1.data.file_group_id, '归入同一版本组');
   eq(a1.data.version_no, 1);
@@ -512,7 +516,7 @@ const t23 = test('AC-23 同一文件第二次上传 → 归入同一 file_group�
   eq(list.data.files.length, 1, '只显示一个文件条目');
   eq(list.data.files[0].versions.length, 2, '有 2 个版本');
   eq(list.data.files[0].current.id, a2.data.attachment.id, '当前版本指向新文件');
-  eq(list.data.files[0].current.size, 20, '当前版本是新文件');
+  eq(list.data.files[0].current.size, Buffer.byteLength('version-two-content-is-longer!!'), '当前版本是新文件（按真实字节数）');
 });
 
 /* ---------------- 评论与 @ ---------------- */
@@ -592,11 +596,52 @@ const t27 = test('AC-27 同设备 24 小时注册第 4 个账号 → 触发人�
   eq(denied.data.error.code, 'HUMAN_CHECK');
 
   S.run('UPDATE otp_codes SET sent_at = ? WHERE phone = ?', Date.now() - 70000, require('../src/server/crypto.js').phoneIndex(phone4));
+
+  // C3 修复：旧的伪造手法（客户端自称 human_verified: true）必须无效
   const s5 = await c4.post('/api/auth/send-code', { phone: phone4 });
-  const passed = await c4.post('/api/auth/login', {
+  const forged = await c4.post('/api/auth/login', {
     phone: phone4, code: s5.data.dev_code, device_id: device, human_verified: true,
   });
+  eq(forged.status, 428, '自称已通过校验不再被信任');
+
+  // 正确姿势：先取服务端签发的凭证，再带着它登录
+  const hc = await c4.post('/api/auth/human-check', { device_id: device });
+  eq(hc.status, 200, '拿到人机校验凭证');
+  assert(typeof hc.data.human_check_token === 'string' && hc.data.human_check_token.length > 20, '凭证非空');
+
+  S.run('UPDATE otp_codes SET sent_at = ? WHERE phone = ?', Date.now() - 70000, require('../src/server/crypto.js').phoneIndex(phone4));
+  const s6 = await c4.post('/api/auth/send-code', { phone: phone4 });
+  const passed = await c4.post('/api/auth/login', {
+    phone: phone4, code: s6.data.dev_code, device_id: device, human_check_token: hc.data.human_check_token,
+  });
   eq(passed.status, 200, '通过校验后放行');
+
+  // 凭证与设备绑定：同一设备可继续复用，换设备则失效
+  const sameDevice5 = S.client();
+  const phone5 = S.nextPhone();
+  const s7 = await sameDevice5.post('/api/auth/send-code', { phone: phone5 });
+  const reuse = await sameDevice5.post('/api/auth/login', {
+    phone: phone5, code: s7.data.dev_code, device_id: device, human_check_token: hc.data.human_check_token,
+  });
+  eq(reuse.status, 200, '同设备可复用未过期的凭证');
+
+  // 换个设备 ID 再用同一张凭证 → 必须失效。
+  // 注意：该设备也得先注册满 3 个账号，否则根本不会走到人机校验这一步。
+  const otherDevice = 'another-device-' + Date.now();
+  for (let i = 0; i < 3; i++) {
+    const cc = S.client();
+    const pp = S.nextPhone();
+    const ss = await cc.post('/api/auth/send-code', { phone: pp });
+    const ll = await cc.post('/api/auth/login', { phone: pp, code: ss.data.dev_code, device_id: otherDevice });
+    eq(ll.status, 200, `另一设备第 ${i + 1} 个账号放行`);
+  }
+  const other = S.client();
+  const phone6 = S.nextPhone();
+  const s8 = await other.post('/api/auth/send-code', { phone: phone6 });
+  const wrongDevice = await other.post('/api/auth/login', {
+    phone: phone6, code: s8.data.dev_code, device_id: otherDevice, human_check_token: hc.data.human_check_token,
+  });
+  eq(wrongDevice.status, 428, '凭证绑定设备，换设备即失效');
 });
 
 /* ---------------- 日历 ---------------- */

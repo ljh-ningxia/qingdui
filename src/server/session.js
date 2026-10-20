@@ -1,10 +1,10 @@
 // 会话：无状态签名 token（HMAC），不依赖 cookie session 存储
 const crypto = require('node:crypto');
 const { one } = require('./db');
+const { sessionKey } = require('./secrets');
 
-const SECRET = crypto.createHash('sha256')
-  .update((process.env.QD_SECRET || 'qingdui-local-dev-secret') + ':session')
-  .digest();
+// C1 修复：密钥不再有源码内公开兜底值，缺失时的行为见 secrets.js
+const SECRET = sessionKey();
 
 const TTL = 30 * 24 * 3600 * 1000;
 

@@ -14,6 +14,51 @@ const Rem = require('./reminders');
 const UPLOAD_DIR = process.env.QD_UPLOADS || path.join(__dirname, '..', '..', 'data', 'uploads');
 fs.mkdirSync(UPLOAD_DIR, { recursive: true });
 
+/* ============ 安全开关（C2 / C3 修复） ============ */
+
+/**
+ * C2 修复：验证码明文回显必须**显式开启**。
+ *
+ * 原实现 `process.env.QD_DEV_CODE !== '0'` 是默认开启 —— 只要没配环境变量，
+ * `/api/auth/send-code` 就会把验证码明文塞进响应体，任何人可以登录任意手机号。
+ *
+ * 现在改为：只有 QD_DEV_CODE === '1' 才回显，且生产环境一律强制关闭。
+ */
+const DEV_CODE_ON = process.env.QD_DEV_CODE === '1' && !process.env.NODE_ENV?.startsWith('prod');
+
+function devCodeEnabled() {
+  return DEV_CODE_ON;
+}
+
+// 人机校验凭证：服务端 HMAC 签发，客户端无法伪造（C3 修复）
+const HUMAN_CHECK_TTL = 10 * 60 * 1000;
+
+function humanCheckToken(deviceId, now = Date.now()) {
+  const exp = now + HUMAN_CHECK_TTL;
+  const body = Buffer.from(JSON.stringify({ d: deviceId, exp })).toString('base64url');
+  const mac = crypto.createHmac('sha256', require('./secrets').sessionKey())
+    .update('human:' + body).digest('base64url');
+  return `${body}.${mac}`;
+}
+
+function verifyHumanCheckToken(token, deviceId, now = Date.now()) {
+  if (!token || typeof token !== 'string') return false;
+  const i = token.lastIndexOf('.');
+  if (i < 0) return false;
+  const body = token.slice(0, i);
+  const mac = token.slice(i + 1);
+  const expect = crypto.createHmac('sha256', require('./secrets').sessionKey())
+    .update('human:' + body).digest('base64url');
+  const a = Buffer.from(mac);
+  const b = Buffer.from(expect);
+  if (a.length !== b.length || !crypto.timingSafeEqual(a, b)) return false;
+  let p;
+  try { p = JSON.parse(Buffer.from(body, 'base64url').toString('utf8')); } catch { return false; }
+  if (!p.exp || p.exp < now) return false;
+  // 凭证与设备绑定，防止把别人的凭证拿来用
+  return p.d === deviceId;
+}
+
 /* ============ FB-01 账号与登录（PRD 7.2） ============ */
 
 const OTP_TTL = 5 * 60 * 1000;
@@ -37,7 +82,7 @@ R.post('/api/auth/send-code', (ctx) => {
   const phone = normalizePhone(ctx.body.phone);
   const now = Date.now();
   const existing = one('SELECT * FROM otp_codes WHERE phone = ?', phoneIndex(phone));
-  const devMode = process.env.QD_DEV_CODE !== '0';
+  const devMode = devCodeEnabled();
 
   if (existing) {
     if (existing.locked_until && existing.locked_until > now) {
@@ -67,12 +112,23 @@ R.post('/api/auth/send-code', (ctx) => {
     );
   });
   // 生产环境此处替换为真实短信网关；本地开发把验证码直接返回，其余逻辑（频控/锁定/一次性）完全相同
+  // C2 修复：只有显式设置 QD_DEV_CODE=1 才回显验证码，其余情况一律视为已发送
   return {
     ok: true,
     dev_code: devMode ? code : undefined,
     expires_in: OTP_TTL / 1000,
     message: devMode ? '验证码已生成（本地开发模式直接显示）' : '验证码已发送',
   };
+}, { public: true });
+
+/**
+ * 人机校验挑战：返回一张服务端签发的凭证（C3 修复）。
+ * 客户端提交 human_check_token，而不是 human_verified: true。
+ */
+R.post('/api/auth/human-check', (ctx) => {
+  const deviceId = String(ctx.body.device_id || '').slice(0, 64);
+  if (!deviceId) throw E.badRequest('缺少设备标识');
+  return { ok: true, human_check_token: humanCheckToken(deviceId), expires_in: HUMAN_CHECK_TTL / 1000 };
 }, { public: true });
 
 R.post('/api/auth/login', (ctx) => {
@@ -98,7 +154,10 @@ R.post('/api/auth/login', (ctx) => {
   if (!user && deviceId) {
     const since = now - 24 * 3600 * 1000;
     const cnt = one('SELECT COUNT(*) AS c FROM users WHERE device_id = ? AND created_at > ?', deviceId, since);
-    if (cnt.c >= 3 && !ctx.body.human_verified) {
+    // C3 修复：不再信任 ctx.body.human_verified 这个客户端布尔值，
+    // 必须是服务端 /api/auth/human-check 签发且与当前设备绑定的凭证
+    const passed = verifyHumanCheckToken(ctx.body.human_check_token, deviceId);
+    if (cnt.c >= 3 && !passed) {
       throw new AppError(428, 'HUMAN_CHECK', '检测到异常注册，请完成人机校验', { need_human_check: true });
     }
   }
@@ -374,7 +433,17 @@ R.post('/api/groups/:id/members/:uid/remove', (ctx) => {
     "SELECT * FROM tasks WHERE group_id = ? AND assignee_id = ? AND deleted_at IS NULL AND status IN ('todo','doing')",
     group.id, uid
   );
+  // C7 修复：transfer_to 必须是本组在册成员。
+  // 原实现直接 `ctx.body.transfer_to || group.owner_id` 就用，传一个不存在的人
+  // （甚至传任意字符串）都会把任务改派过去，任务从此不属于任何小组成员，
+  // 变成永久数据错乱且无法通过界面修复。
   const target = ctx.body.transfer_to || group.owner_id;
+  if (target !== group.owner_id) {
+    if (typeof target !== 'string') throw E.badRequest('转交对象不对');
+    const tm = Dom.membershipOf(group.id, target);
+    if (!tm) throw E.badRequest('只能在小组现有成员之间转交任务');
+    if (target === uid) throw E.badRequest('不能把任务转交给即将被移除的人');
+  }
   tx(() => {
     run('UPDATE memberships SET deleted_at = ? WHERE id = ?', Date.now(), m.id);
     for (const t of tasks) {
@@ -840,20 +909,35 @@ R.post('/api/tasks/:id/files', (ctx) => {
   const t = Dom.getTask(ctx.params.id);
   const { group } = Dom.requireMember(t.group_id, ctx.user.id);
   Dom.assertWritable(group);
-  const { filename, size, mime, data_b64 } = ctx.body;
+  const { filename, mime, data_b64 } = ctx.body;
   const name = String(filename || 'file').slice(0, 120);
-  const sz = Number(size || 0);
+  const mid = String(mime || 'application/octet-stream');
+
+  // C5 修复：不再采用客户端上报的 size。
+  // 原实现信 `Number(size)`，声明 1 字节实传 2MB 也能通过配额校验，
+  // 组计数器只 +1，配额可无限绕过。
+  // 现在先解码取真实字节数，配额按真实值判定，落库也写真实值。
+  if (!data_b64) throw E.badRequest('文件是空的');
+  let buf;
+  try {
+    buf = Buffer.from(String(data_b64), 'base64');
+  } catch {
+    throw E.badRequest('文件内容格式不对');
+  }
+  const sz = buf.length;
   if (!sz) throw E.badRequest('文件是空的');
   quotaCheck(group, sz);
-  const mid = String(mime || 'application/octet-stream');
 
   const attId = randomId('att');
   const storageKey = `${group.id}/${attId}`;
   const filePath = path.join(UPLOAD_DIR, storageKey.replace(/[/]/g, '_'));
-  if (data_b64) {
-    fs.writeFileSync(filePath, Buffer.from(data_b64, 'base64'));
-  } else {
-    fs.writeFileSync(filePath, Buffer.alloc(0));
+  fs.writeFileSync(filePath, buf);
+
+  // 写盘后再核对一次，防止 base64 与声明不一致造成计数漂移
+  const onDisk = fs.statSync(filePath).size;
+  if (onDisk !== sz) {
+    try { fs.unlinkSync(filePath); } catch { /* ignore */ }
+    throw E.badRequest('文件写入校验失败，请重试');
   }
 
   let fileGroupId;
@@ -920,8 +1004,9 @@ R.post('/api/attachments/:id/url', (ctx) => {
 }, { auth: true });
 
 function signDownload(id, uid, exp) {
-  return crypto.createHmac('sha256', (process.env.QD_SECRET || 'qingdui-local-dev-secret') + ':dl')
-    .update(`${id}|${uid}|${exp}`).digest('base64url');
+  // C1 同类修复：原先这里也用了公开常量兜底，改为统一走 secrets.js
+  return crypto.createHmac('sha256', require('./secrets').sessionKey())
+    .update(`dl:${id}|${uid}|${exp}`).digest('base64url');
 }
 
 // 下载：校验签名与过期（AC-21）
